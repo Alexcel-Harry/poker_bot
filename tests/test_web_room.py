@@ -1,0 +1,177 @@
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from poker_arena import Action, CheckCallBot
+from poker_arena.web.bot_loader import bot_policy_factory_from_env
+from poker_arena.web.room import PokerRoom
+
+
+class PokerRoomSecurityTests(unittest.TestCase):
+    def test_room_has_distinct_host_token_and_guest_code(self):
+        room = PokerRoom(seed=11)
+
+        self.assertNotEqual(room.host_token, room.room_code)
+        self.assertGreaterEqual(len(room.host_token), 20)
+        self.assertGreaterEqual(len(room.room_code), 6)
+
+    def test_guest_claims_seat_with_room_code_and_secret_token(self):
+        room = PokerRoom(seed=11)
+
+        claim = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+
+        self.assertEqual(claim["seat_id"], 0)
+        self.assertEqual(claim["nickname"], "Ada")
+        self.assertGreaterEqual(len(claim["seat_token"]), 20)
+        with self.assertRaises(PermissionError):
+            room.join(room_code="bad-code", seat_id=1, nickname="Grace")
+        with self.assertRaises(ValueError):
+            room.join(room_code=room.room_code, seat_id=0, nickname="Grace")
+
+    def test_host_can_reserve_bot_but_invalid_host_cannot(self):
+        room = PokerRoom(seed=11)
+
+        with self.assertRaises(PermissionError):
+            room.reserve_bot(host_token="bad-token", seat_id=2)
+
+        bot = room.reserve_bot(host_token=room.host_token, seat_id=2)
+
+        self.assertEqual(bot["seat_id"], 2)
+        self.assertEqual(bot["kind"], "bot")
+        self.assertIn(".pt pending", bot["nickname"])
+
+    def test_host_cannot_modify_human_seat_with_bot_reservation(self):
+        room = PokerRoom(seed=11)
+        room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+
+        with self.assertRaises(ValueError):
+            room.reserve_bot(host_token=room.host_token, seat_id=0)
+
+
+class PokerRoomPlayTests(unittest.TestCase):
+    def test_player_payload_only_contains_own_private_cards(self):
+        room = PokerRoom(seed=7)
+        ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+        grace = room.join(room_code=room.room_code, seat_id=1, nickname="Grace")
+
+        ada_payload = room.snapshot_for(seat_token=ada["seat_token"])
+        grace_payload = room.snapshot_for(seat_token=grace["seat_token"])
+        public_payload = room.snapshot_for()
+
+        self.assertEqual(len(ada_payload["private_hole_cards"]), 2)
+        self.assertEqual(len(grace_payload["private_hole_cards"]), 2)
+        self.assertNotEqual(ada_payload["private_hole_cards"], grace_payload["private_hole_cards"])
+        self.assertIsNone(public_payload["private_hole_cards"])
+        self.assertNotIn("deck_cards", str(public_payload))
+
+    def test_wrong_seat_cannot_submit_current_player_action(self):
+        room = PokerRoom(seed=7)
+        ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+        grace = room.join(room_code=room.room_code, seat_id=1, nickname="Grace")
+
+        self.assertEqual(room.snapshot_for()["current_actor"], 0)
+        with self.assertRaises(PermissionError):
+            room.submit_action(seat_token=grace["seat_token"], action=Action.call())
+
+        room.submit_action(seat_token=ada["seat_token"], action=Action.call())
+
+    def test_inactive_bot_turn_pauses_table(self):
+        room = PokerRoom(seed=7)
+        ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+        room.reserve_bot(host_token=room.host_token, seat_id=1)
+
+        room.submit_action(seat_token=ada["seat_token"], action=Action.call())
+        payload = room.snapshot_for(seat_token=ada["seat_token"])
+
+        self.assertEqual(payload["current_actor"], 1)
+        self.assertEqual(payload["status"], "paused")
+        self.assertEqual(payload["paused_reason"], "waiting for unavailable bot")
+
+    def test_policy_backed_bot_auto_advances_after_human_action(self):
+        room = PokerRoom(seed=7, bot_policy_factory=lambda _seat_id: CheckCallBot())
+        ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+        room.reserve_bot(host_token=room.host_token, seat_id=1)
+
+        room.submit_action(seat_token=ada["seat_token"], action=Action.call())
+        payload = room.snapshot_for(seat_token=ada["seat_token"])
+
+        self.assertEqual(payload["status"], "playing")
+        self.assertEqual(payload["current_actor"], 0)
+        self.assertTrue(
+            any(
+                event["event_type"] == "action"
+                and event["data"]["seat_id"] == 1
+                and event["data"]["action"]["type"] == "check"
+                for event in payload["log"]
+            )
+        )
+
+    def test_policy_backed_bot_auto_advances_when_human_join_starts_hand(self):
+        room = PokerRoom(seed=7, bot_policy_factory=lambda _seat_id: CheckCallBot())
+        room.reserve_bot(host_token=room.host_token, seat_id=0)
+
+        ada = room.join(room_code=room.room_code, seat_id=1, nickname="Ada")
+        payload = room.snapshot_for(seat_token=ada["seat_token"])
+
+        self.assertEqual(payload["status"], "playing")
+        self.assertEqual(payload["current_actor"], 1)
+
+    def test_bot_advance_guard_stops_bot_only_loops(self):
+        room = PokerRoom(seed=7, bot_policy_factory=lambda _seat_id: CheckCallBot())
+        room.reserve_bot(host_token=room.host_token, seat_id=0)
+        room.reserve_bot(host_token=room.host_token, seat_id=1)
+
+        with self.assertRaises(RuntimeError):
+            room.advance_bots(max_actions=1)
+
+    def test_session_log_excludes_private_cards_and_snapshots(self):
+        room = PokerRoom(seed=7)
+        ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+        room.join(room_code=room.room_code, seat_id=1, nickname="Grace")
+        room.submit_action(seat_token=ada["seat_token"], action=Action.call())
+
+        log = room.session_log(host_token=room.host_token)
+
+        self.assertEqual(log["room_code"], room.room_code)
+        self.assertTrue(log["hands"])
+        self.assertNotIn("snapshot", str(log))
+        self.assertNotIn("hole_cards", str(log))
+        with self.assertRaises(PermissionError):
+            room.session_log(host_token="bad-token")
+
+
+class StaticAppTests(unittest.TestCase):
+    def test_bot_policy_factory_from_env_loads_one_shared_checkpoint(self):
+        loaded_policy = CheckCallBot()
+
+        with patch("poker_arena.bots.TorchPolicyBot.from_checkpoint", return_value=loaded_policy) as load:
+            factory = bot_policy_factory_from_env(
+                {"POKER_BOT_MODEL": "runs/poker_policy.pt", "POKER_BOT_DEVICE": "cpu"}
+            )
+
+            self.assertIsNotNone(factory)
+            assert factory is not None
+            self.assertIs(factory(1), loaded_policy)
+            self.assertIs(factory(2), loaded_policy)
+            load.assert_called_once_with("runs/poker_policy.pt", device="cpu")
+
+    def test_bot_policy_factory_from_env_returns_none_without_model_path(self):
+        self.assertIsNone(bot_policy_factory_from_env({}))
+
+    def test_static_frontend_contains_required_controls(self):
+        static_dir = Path(__file__).resolve().parents[1] / "src" / "poker_arena" / "web" / "static"
+
+        index = (static_dir / "index.html").read_text()
+        app_js = (static_dir / "app.js").read_text()
+
+        self.assertIn("seat-grid", index)
+        self.assertIn("raiseByInput", index)
+        self.assertIn("Raise By", index)
+        self.assertIn("downloadLog", app_js)
+        self.assertIn("raise_by", app_js)
+        self.assertIn("raiseByToRaiseTo", app_js)
+        self.assertIn("localStorage", app_js)
+
+
+if __name__ == "__main__":
+    unittest.main()

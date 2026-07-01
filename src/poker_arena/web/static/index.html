@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Poker Arena</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar" aria-label="Room status">
+        <div>
+          <p class="eyebrow">Poker Arena</p>
+          <h1 id="roomTitle">Room</h1>
+        </div>
+        <div class="status-strip">
+          <span id="connectionStatus">offline</span>
+          <span id="gameStatus">waiting</span>
+          <span id="blindStatus">10 / 20</span>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <aside class="lobby-panel" aria-label="Lobby">
+          <div class="panel-section">
+            <h2>Join</h2>
+            <label>
+              Room code
+              <input id="roomCodeInput" autocomplete="off" />
+            </label>
+            <label>
+              Nickname
+              <input id="nicknameInput" maxlength="24" autocomplete="nickname" />
+            </label>
+            <label>
+              Seat
+              <select id="seatSelect"></select>
+            </label>
+            <button id="joinButton" class="primary">Take Seat</button>
+          </div>
+
+          <div class="panel-section">
+            <h2>Host</h2>
+            <label>
+              Host token
+              <input id="hostTokenInput" autocomplete="off" />
+            </label>
+            <label>
+              Bot seat
+              <select id="botSeatSelect"></select>
+            </label>
+            <button id="addBotButton">Reserve Bot</button>
+            <button id="downloadLogButton">Download Log</button>
+          </div>
+
+          <div class="panel-section">
+            <h2>Hand Log</h2>
+            <ol id="handLog" class="hand-log"></ol>
+          </div>
+        </aside>
+
+        <section class="table-zone" aria-label="Poker table">
+          <div class="table-oval">
+            <div class="felt-lines" aria-hidden="true"></div>
+            <div id="seat-grid" class="seat-grid"></div>
+            <div class="board-center">
+              <div id="potDisplay" class="pot">Pot 0</div>
+              <div id="boardCards" class="board-cards"></div>
+              <div id="streetDisplay" class="street">waiting</div>
+            </div>
+          </div>
+
+          <div class="action-rail" aria-label="Actions">
+            <div id="privateCards" class="private-cards"></div>
+            <div class="action-buttons">
+              <button id="foldButton">Fold</button>
+              <button id="checkButton">Check</button>
+              <button id="callButton">Call</button>
+            </div>
+            <div class="raise-box">
+              <input id="raiseByInput" type="number" min="1" step="1" inputmode="numeric" aria-label="Raise by amount" />
+              <button id="raiseButton" class="primary">Raise By</button>
+              <div class="quick-raises">
+                <button data-raise="min">Min</button>
+                <button data-raise="half">Half Pot</button>
+                <button data-raise="pot">Pot</button>
+                <button data-raise="allin">All In</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <template id="seatTemplate">
+      <button class="seat">
+        <span class="seat-number"></span>
+        <span class="seat-name"></span>
+        <span class="seat-stack"></span>
+        <span class="seat-badges"></span>
+      </button>
+    </template>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

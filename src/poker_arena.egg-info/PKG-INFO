@@ -1,0 +1,57 @@
+Metadata-Version: 2.4
+Name: poker-arena
+Version: 0.1.0
+Summary: A small event-sourced No Limit Hold'em engine for bot experiments.
+Author: Poker Arena contributors
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn[standard]>=0.30
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+
+# Poker Arena
+
+`poker_arena` is a small Python rules engine for No Limit Hold'em experiments.
+
+The first version focuses on a deterministic, testable engine:
+
+- 2-9 seats
+- integer chips
+- arbitrary legal `raise_to(total_commitment)` actions
+- standard blinds, betting rounds, all-ins, side pots, and showdown
+- internal 5/7-card evaluator
+- event history with public and player-specific views
+- simple bot policy hooks and a headless demo
+
+Run the demo from this folder:
+
+```bash
+PYTHONPATH=src python3.13 examples/headless_demo.py
+```
+
+Run the local web table:
+
+```bash
+PYTHONPATH=src python3.13 -m poker_arena.web --port 8000
+```
+
+Use `--lan` to listen on your LAN:
+
+```bash
+PYTHONPATH=src python3.13 -m poker_arena.web --port 8000 --lan
+```
+
+The server prints a private host URL/token and a guest room code. LAN mode uses plain HTTP and is not safe for public Internet exposure. For remote play outside a trusted local network, put the app behind HTTPS with a real deployment or a tunnel that provides access controls.
+
+Run the tests with pytest if installed:
+
+```bash
+PYTHONPATH=src python3.13 -m pytest
+```
+
+The tests are also compatible with the standard library runner:
+
+```bash
+PYTHONPATH=src python3.13 -m unittest discover -s tests -v
+```
