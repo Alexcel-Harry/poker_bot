@@ -1,10 +1,27 @@
 import unittest
+import importlib
 from pathlib import Path
 from unittest.mock import patch
 
 from poker_arena import Action, CheckCallBot
 from poker_arena.web.bot_loader import bot_policy_factory_from_env
 from poker_arena.web.room import PokerRoom
+
+
+class FakeWebSocket:
+    def __init__(self) -> None:
+        self.accepted = False
+        self.sent: list[dict[str, object]] = []
+        self.closed: tuple[int, str] | None = None
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def send_json(self, payload: dict[str, object]) -> None:
+        self.sent.append(payload)
+
+    async def close(self, code: int, reason: str) -> None:
+        self.closed = (code, reason)
 
 
 class PokerRoomSecurityTests(unittest.TestCase):
@@ -163,6 +180,7 @@ class StaticAppTests(unittest.TestCase):
 
         index = (static_dir / "index.html").read_text()
         app_js = (static_dir / "app.js").read_text()
+        styles = (static_dir / "styles.css").read_text()
 
         self.assertIn("seat-grid", index)
         self.assertIn("raiseByInput", index)
@@ -171,6 +189,45 @@ class StaticAppTests(unittest.TestCase):
         self.assertIn("raise_by", app_js)
         self.assertIn("raiseByToRaiseTo", app_js)
         self.assertIn("localStorage", app_js)
+        self.assertIn('localStorage.removeItem("pokerArenaSeatToken")', app_js)
+        self.assertIn("INVALID_SEAT_TOKEN_CLOSE_CODE", app_js)
+        self.assertIn('document.getElementById("roomCodeInput").value = snap.room_code', app_js)
+        self.assertNotIn('document.getElementById("roomCodeInput").value ||= snap.room_code', app_js)
+        self.assertNotIn('.seat[data-seat="8"] { left: calc(50% - 67px); top: 42%; }', styles)
+        self.assertIn('.seat[data-seat="8"] { left: 18%; top: 72px; }', styles)
+        self.assertIn("styles.css?v=20260724-session-recovery-2", index)
+        self.assertIn("app.js?v=20260724-session-recovery-2", index)
+
+
+class WebSocketSessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_stored_seat_token_closes_cleanly_without_registering_connection(self):
+        web_app = importlib.import_module("poker_arena.web.app")
+        connection_manager = web_app.ConnectionManager()
+        websocket = FakeWebSocket()
+
+        with patch.object(web_app, "room", PokerRoom(seed=17)):
+            connected = await connection_manager.connect(websocket, "expired-seat-token")
+
+        self.assertFalse(connected)
+        self.assertTrue(websocket.accepted)
+        self.assertEqual(websocket.closed[0], web_app.INVALID_SEAT_TOKEN_CLOSE_CODE)
+        self.assertIn("expired", websocket.closed[1].lower())
+        self.assertEqual(connection_manager._connections, [])
+        self.assertEqual(websocket.sent, [])
+
+    async def test_anonymous_reconnect_receives_public_snapshot(self):
+        web_app = importlib.import_module("poker_arena.web.app")
+        connection_manager = web_app.ConnectionManager()
+        websocket = FakeWebSocket()
+        fresh_room = PokerRoom(seed=17)
+
+        with patch.object(web_app, "room", fresh_room):
+            connected = await connection_manager.connect(websocket, None)
+
+        self.assertTrue(connected)
+        self.assertIsNone(websocket.closed)
+        self.assertEqual(websocket.sent[0]["room_code"], fresh_room.room_code)
+        self.assertEqual(len(connection_manager._connections), 1)
 
 
 if __name__ == "__main__":

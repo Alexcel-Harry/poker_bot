@@ -1,0 +1,11 @@
+name: poker_ai_env
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip>=24
+  - setuptools>=68
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu129
+      - torch==2.8.0+cu129
+      - -e .[dev]

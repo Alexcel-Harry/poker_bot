@@ -54,6 +54,11 @@ class TorchPolicyBot:
         self.payload = payload
         self.device = device
         self.state_encoder = StateFeatureEncoder()
+        state_dim = getattr(metadata, "state_dim", None)
+        if state_dim != self.state_encoder.dimension:
+            raise ValueError(
+                f"Checkpoint state dimension {state_dim} does not match encoder dimension {self.state_encoder.dimension}"
+            )
         self.trajectory_encoder = TrajectoryEncoder()
         self.action_embedding = ActionEmbedding()
         model_config = payload.get("model_config", {})

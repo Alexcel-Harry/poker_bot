@@ -16,7 +16,7 @@ from poker_arena.table import TableConfig  # noqa: E402
 def run_training(iterations: int = 20) -> dict[str, object]:
     config = PrefixBranchTrainingConfig(
         branch_width=6,
-        branch_depth=4,
+        branch_depth=0,
         integer_action_budget=10,
         max_actions_per_episode=20,
         random_seed=17,

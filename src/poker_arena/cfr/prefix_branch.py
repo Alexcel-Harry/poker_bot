@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import random
-from typing import Sequence
+from typing import Callable, Sequence
 
 from poker_arena.actions import Action, ActionType, LegalActions
 from poker_arena.cfr.core import CFRTrainingResult, InformationSetEncoder
@@ -26,15 +26,34 @@ def _action_key(action: Action) -> tuple[str, int | None]:
 @dataclass
 class EmbeddingCoverageIndex:
     vectors: list[list[float]] = field(default_factory=list)
+    max_vectors: int = 4096
+    search_size: int = 64
+    _next_index: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.max_vectors <= 0:
+            raise ValueError("max_vectors must be positive")
+        if self.search_size <= 0:
+            raise ValueError("search_size must be positive")
 
     def novelty(self, vector: Sequence[float]) -> float:
         if not self.vectors:
             return 1.0
-        nearest = min(TrajectoryEncoder.distance(vector, existing) for existing in self.vectors)
+        if len(self.vectors) <= self.search_size:
+            candidates = self.vectors
+        else:
+            stride = max(1, len(self.vectors) // self.search_size)
+            candidates = self.vectors[::stride][: self.search_size]
+        nearest = min(TrajectoryEncoder.distance(vector, existing) for existing in candidates)
         return nearest / (1.0 + nearest)
 
     def record(self, vector: Sequence[float]) -> None:
-        self.vectors.append([float(value) for value in vector])
+        values = [float(value) for value in vector]
+        if len(self.vectors) < self.max_vectors:
+            self.vectors.append(values)
+            return
+        self.vectors[self._next_index] = values
+        self._next_index = (self._next_index + 1) % self.max_vectors
 
 
 class ActionEmbedding:
@@ -147,7 +166,7 @@ class IntegerActionSampler:
 
         remaining = max(0, capacity - len(set(totals)))
         if remaining:
-            pool_size = max(remaining * 4, remaining)
+            pool_size = max(remaining * 2, remaining)
             pool = [self.rng.randint(minimum, maximum) for _ in range(pool_size)]
             if coverage_index is not None and self.novelty_weight > 0 and trajectory_embedding is not None:
                 pool = sorted(
@@ -259,22 +278,33 @@ class PrefixBranchExplorer:
 
     def _rollout_action(self, state: HandState, actor: int, rng: random.Random) -> Action:
         legal = state.legal_actions(actor)
+        actions: list[Action] = []
         if legal.can_check:
-            return Action.check()
-        if legal.can_call:
-            return Action.call()
-        if legal.can_fold:
-            return Action.fold()
+            actions.append(Action.check())
+        elif legal.can_call:
+            actions.extend((Action.fold(), Action.call()))
         if legal.can_raise and legal.min_raise_to is not None and legal.max_raise_to is not None:
-            return Action.raise_to(rng.randint(legal.min_raise_to, legal.max_raise_to))
-        return Action.fold()
+            totals = {legal.min_raise_to, legal.max_raise_to}
+            if legal.max_raise_to > legal.min_raise_to:
+                totals.add(rng.randint(legal.min_raise_to, legal.max_raise_to))
+            actions.extend(Action.raise_to(total) for total in sorted(totals))
+        if not actions and legal.can_fold:
+            actions.append(Action.fold())
+        return rng.choice(actions)
 
     def _utilities(self, table: Table) -> list[float]:
         state = table.current_hand
         if state is None:
             return [0.0] * table.config.seats
         starting = table.config.starting_stacks
-        return [player.stack - starting[player.seat_id] for player in state.players]
+        utilities = [float(player.stack - starting[player.seat_id]) for player in state.players]
+        if not state.is_terminal:
+            eligible = [player.seat_id for player in state.players if not player.folded]
+            if eligible:
+                neutral_share = state.total_pot / len(eligible)
+                for seat_id in eligible:
+                    utilities[seat_id] += neutral_share
+        return utilities
 
     def _clone_table(self, table: Table) -> Table:
         clone = Table(table.config)
@@ -301,7 +331,7 @@ class PrefixBranchExplorer:
 @dataclass(frozen=True)
 class PrefixBranchTrainingConfig:
     branch_width: int = 32
-    branch_depth: int = 8
+    branch_depth: int = 0
     integer_action_budget: int = 32
     novelty_weight: float = 1.0
     neighbor_weight: float = 0.0
@@ -309,6 +339,24 @@ class PrefixBranchTrainingConfig:
     max_actions_per_episode: int = 200
     random_seed: int | None = None
     max_workers: int = 1
+    coverage_capacity: int = 4096
+    replay_capacity: int = 50_000
+
+    def __post_init__(self) -> None:
+        if self.branch_width <= 0:
+            raise ValueError("branch_width must be positive")
+        if self.branch_depth < 0:
+            raise ValueError("branch_depth must be non-negative; use 0 for terminal rollouts")
+        if self.integer_action_budget <= 0:
+            raise ValueError("integer_action_budget must be positive")
+        if self.max_actions_per_episode <= 0:
+            raise ValueError("max_actions_per_episode must be positive")
+        if self.max_workers <= 0:
+            raise ValueError("max_workers must be positive")
+        if self.coverage_capacity <= 0:
+            raise ValueError("coverage_capacity must be positive")
+        if self.replay_capacity <= 0:
+            raise ValueError("replay_capacity must be positive")
 
 
 @dataclass(frozen=True)
@@ -346,11 +394,13 @@ class PrefixBranchCFRTrainer:
         self.table_config = table_config
         self.config = config or PrefixBranchTrainingConfig()
         self.rng = random.Random(self.config.random_seed)
+        replay_seed = None if self.config.random_seed is None else self.config.random_seed + 1_000_003
+        self.replay_rng = random.Random(replay_seed)
         self.infoset_encoder = infoset_encoder or InformationSetEncoder()
         self.trajectory_encoder = trajectory_encoder or TrajectoryEncoder()
         self.state_feature_encoder = StateFeatureEncoder()
         self.action_embedding = ActionEmbedding()
-        self.coverage_index = EmbeddingCoverageIndex()
+        self.coverage_index = EmbeddingCoverageIndex(max_vectors=self.config.coverage_capacity)
         self.action_sampler = action_sampler or IntegerActionSampler(
             random_seed=self.config.random_seed,
             novelty_weight=self.config.novelty_weight,
@@ -366,12 +416,21 @@ class PrefixBranchCFRTrainer:
         self.nodes: dict[str, IntegerCFRNode] = {}
         self.training_samples: list[ActionTrainingSample] = []
         self.torch_training_samples: list[TorchTrainingSample] = []
+        self.samples_seen = 0
 
-    def train(self, iterations: int) -> CFRTrainingResult:
+    def train(
+        self,
+        iterations: int,
+        progress_callback: Callable[[int, int, int], None] | None = None,
+    ) -> CFRTrainingResult:
+        if iterations <= 0:
+            raise ValueError("iterations must be positive")
         for iteration in range(iterations):
             table = Table(self._iteration_config(iteration))
             table.start_hand()
             self._run_episode(table)
+            if progress_callback is not None:
+                progress_callback(iteration + 1, iterations, self.samples_seen)
         return CFRTrainingResult(iterations=iterations, information_sets=len(self.nodes), episodes=iterations)
 
     def _run_episode(self, table: Table) -> None:
@@ -382,7 +441,8 @@ class PrefixBranchCFRTrainer:
             actor = state.current_actor
             legal = state.legal_actions(actor)
             state_features = self.state_feature_encoder.encode_state(state, actor)
-            trajectory = self.trajectory_encoder.encode_events(state.events)
+            public_events = [event for event in state.events if event.event_type != "snapshot"]
+            trajectory = self.trajectory_encoder.encode_events(public_events)
             actions = self.action_sampler.sample(
                 state,
                 actor,
@@ -407,26 +467,24 @@ class PrefixBranchCFRTrainer:
                 node.regrets[index] += utility - expected
                 node.strategy_sum[index] += strategy[node.labels[index]]
                 branch = branches[index]
-                self.training_samples.append(
-                    ActionTrainingSample(
-                        infoset_key=key,
-                        action=branch.action,
-                        action_embedding=branch.action_embedding,
-                        trajectory_embedding=branch.trajectory_embedding,
-                        target_utility=utility,
-                        weight=1.0,
-                    )
+                action_sample = ActionTrainingSample(
+                    infoset_key=key,
+                    action=branch.action,
+                    action_embedding=branch.action_embedding,
+                    trajectory_embedding=branch.trajectory_embedding,
+                    target_utility=utility,
+                    weight=1.0,
                 )
-                self.torch_training_samples.append(
-                    TorchTrainingSample(
-                        state_features=state_features,
-                        trajectory_features=trajectory,
-                        action_features=self.action_embedding.encode(branch.action, legal),
-                        action=branch.action.to_dict(),
-                        target_utility=utility,
-                        weight=1.0,
-                    )
+                utility_scale = max(1, self.table_config.starting_stacks[actor])
+                torch_sample = TorchTrainingSample(
+                    state_features=state_features,
+                    trajectory_features=trajectory,
+                    action_features=self.action_embedding.encode(branch.action, legal),
+                    action=branch.action.to_dict(),
+                    target_utility=utility / utility_scale,
+                    weight=1.0,
                 )
+                self._record_samples(action_sample, torch_sample)
                 self.coverage_index.record(branch.action_embedding)
             node.visits += 1
 
@@ -435,6 +493,17 @@ class PrefixBranchCFRTrainer:
                 table.apply(chosen.action)
             except ValueError:
                 table.apply(PrefixBranchExplorer._fallback_action(state, actor))
+
+    def _record_samples(self, action_sample: ActionTrainingSample, torch_sample: TorchTrainingSample) -> None:
+        self.samples_seen += 1
+        if len(self.training_samples) < self.config.replay_capacity:
+            self.training_samples.append(action_sample)
+            self.torch_training_samples.append(torch_sample)
+            return
+        replacement = self.replay_rng.randrange(self.samples_seen)
+        if replacement < self.config.replay_capacity:
+            self.training_samples[replacement] = action_sample
+            self.torch_training_samples[replacement] = torch_sample
 
     def _node_for(self, key: str, labels: Sequence[str]) -> IntegerCFRNode:
         existing = self.nodes.get(key)

@@ -23,15 +23,26 @@ app = FastAPI(title="Poker Arena")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+INVALID_SEAT_TOKEN_CLOSE_CODE = 4401
+
 
 class ConnectionManager:
     def __init__(self) -> None:
         self._connections: list[tuple[WebSocket, str | None]] = []
 
-    async def connect(self, websocket: WebSocket, seat_token: str | None) -> None:
+    async def connect(self, websocket: WebSocket, seat_token: str | None) -> bool:
         await websocket.accept()
+        try:
+            snapshot = room.snapshot_for(seat_token=seat_token) if seat_token else room.snapshot_for()
+        except PermissionError:
+            await websocket.close(
+                code=INVALID_SEAT_TOKEN_CLOSE_CODE,
+                reason="Seat session expired; reconnect without the stored token",
+            )
+            return False
         self._connections.append((websocket, seat_token))
-        await websocket.send_json(room.snapshot_for(seat_token=seat_token) if seat_token else room.snapshot_for())
+        await websocket.send_json(snapshot)
+        return True
 
     def disconnect(self, websocket: WebSocket) -> None:
         self._connections = [(ws, token) for ws, token in self._connections if ws is not websocket]
@@ -113,7 +124,8 @@ async def session_json(host_token: str) -> JSONResponse:
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     seat_token = websocket.query_params.get("seat_token")
-    await manager.connect(websocket, seat_token)
+    if not await manager.connect(websocket, seat_token):
+        return
     try:
         while True:
             message = await websocket.receive_text()

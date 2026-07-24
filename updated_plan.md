@@ -1,137 +1,71 @@
-# Updated Plan and Implementation Summary
+# GPU Training Rewrite
 
-## Context
+## Goal
 
-The training discussion started from `train_poker_v7.ipynb`, which is a standalone RLCard/PyTorch Deep CFR prototype. The notebook improves throughput by running 64 independent games in parallel, batching neural-network inference by player, using replay buffers, and training with mixed precision. It is useful as a batching and GPU-utilization reference, but it uses a limited ratio-based action abstraction and does not implement same-prefix branch expansion.
+Make same-prefix branch expansion the unit of GPU parallelism instead of using
+the GPU only for a short neural-network fit after CPU rollouts.
 
-The project requirement was clarified as follows:
+## Implemented Architecture
 
-- Preserve arbitrary integer `raise_to(total)` actions as first-class actions.
-- Do not reduce training or inference to fixed pot-ratio choices.
-- Build training around prefix branch expansion: sample many concrete legal actions from the same table snapshot, clone branches, and evaluate those branches.
-- Use trajectory and action embeddings to guide exploration and shape action-conditioned training samples.
+The supported RTX entry point is now `examples/train_gpu_prefix_branch.py`.
+It is CUDA-only and fails fast when CUDA or exactly one requested GPU is not
+available. The legacy Python engine/CFR path remains as a small reference
+implementation, but the RTX script does not call it.
 
-## What Changed
+`TensorPokerState` stores a batch of complete Hold'em states in device tensors:
 
-### Integer-Action Sampling
+- stacks, street and total commitments, folds, all-ins, acted flags, and actors;
+- independently shuffled 52-card decks, private cards, boards, and deal cursors;
+- current bets and minimum full-raise state;
+- tensor-native trajectory aggregates needed by the deployed model.
 
-Added `IntegerActionSampler`, which samples concrete legal actions from the engine:
+For every live decision checkpoint, the trainer:
 
-- Includes fold, check, and call when legal.
-- Samples arbitrary legal integer `raise_to(total)` amounts.
-- Preserves required/user-provided integer raise amounts when they are legal.
-- Deduplicates concrete actions by action type and total amount.
-- Can use embedding novelty to prefer less-covered action regions.
+1. generates concrete legal fold/check/call/integer-raise candidates on CUDA;
+2. repeats each checkpoint into a fixed `hands x branches` tensor batch;
+3. applies every valid candidate without mutating the original prefix;
+4. performs all random rollout state transitions and card dealing on CUDA;
+5. evaluates seven-card hands and settles main/side pots on CUDA;
+6. writes action-conditioned targets into a CUDA-resident ring replay buffer;
+7. performs online mixed-precision optimizer steps throughout generation;
+8. chooses a policy/epsilon action and continues from its immediate checkpoint.
 
-### Action and Trajectory Embeddings
+The main throughput control is `--parallel-hands` (default 1,024). The default
+branch width is 32, so a full checkpoint can expose roughly 32,768 branch rows
+to the GPU before terminal rollouts compact naturally through masks.
 
-Added `ActionEmbedding` and `EmbeddingCoverageIndex`.
+## Correctness and Compatibility
 
-`ActionEmbedding` encodes concrete actions with continuous numeric features, including:
+The generated checkpoint retains the existing `StateFeatureEncoder`,
+`ActionEmbedding`, trajectory dimension, and `TorchPolicyBot` input contract.
+The model therefore remains loadable by the web table and existing bot API.
 
-- action type,
-- raise total,
-- position within legal raise interval,
-- amount added over current bet,
-- call/current-bet/min/max context,
-- optional trajectory embedding appended to the action vector.
+The tensor simulator includes exact integer betting rules, short all-ins,
+street transitions, exact best-five-of-seven ranking, unequal-stack side pots,
+split pots, and deterministic odd-chip assignment within an independent hand.
+If the rollout safety limit is reached before a terminal state, the unfinished
+pot is assigned as a neutral zero-sum share among live players.
 
-This means nearby integer bet amounts, such as `raise_to(123)` and `raise_to(124)`, produce nearby embeddings without turning them into fixed labels.
+## Verification Performed Without Launching Training
 
-`EmbeddingCoverageIndex` records explored embeddings and assigns higher novelty to less-covered regions. This currently guides exploration; it does not replace exact information-set identity.
+- Tensor evaluator ordering matched the Python reference evaluator across
+  randomized seven-card hands.
+- A three-player unequal-stack all-in/side-pot hand matched the reference engine
+  after every action and at terminal settlement.
+- Batched random rollouts terminated and conserved chips.
+- Checkpoint branch tensors did not mutate their source prefix.
+- CUDA-only CLI validation, configuration validation, and help paths passed.
+- The complete 79-test project suite passed.
+- `git diff --check` passed.
 
-### Prefix Branch Expansion
+No rewritten CUDA training run was launched during this pass.
 
-Added `PrefixBranchExplorer`.
+## Supported 10k Command
 
-It takes one live table prefix, clones the table for each selected concrete action, applies that action in the clone, rolls forward for a bounded depth, and returns `BranchResult` objects containing:
-
-- the concrete action,
-- utility vector,
-- terminal flag,
-- rollout step count,
-- trajectory embedding,
-- action embedding.
-
-The original table snapshot is not mutated by branch expansion.
-
-### Prefix-Branch CFR Trainer
-
-Added `PrefixBranchCFRTrainer` and `PrefixBranchTrainingConfig`.
-
-The trainer:
-
-- samples legal integer actions at each decision point,
-- expands branches from the same prefix,
-- computes exact branch rollout utilities as the primary target,
-- updates per-information-set regrets for the expanded concrete actions,
-- records action-conditioned training samples for future learned inference,
-- tracks embedding coverage for novelty-guided exploration.
-
-`neighbor_weight` exists in the config and defaults to `0.0`, so neighbor smoothing is disabled by default. This keeps exact branch rollout outcomes as the main training signal.
-
-### Public Interfaces
-
-The following interfaces were added and exported from `poker_arena.cfr` and top-level `poker_arena`:
-
-- `ActionEmbedding`
-- `ActionTrainingSample`
-- `BranchResult`
-- `EmbeddingCoverageIndex`
-- `IntegerActionSampler`
-- `PrefixBranchCFRTrainer`
-- `PrefixBranchExplorer`
-- `PrefixBranchTrainingConfig`
-
-### Example and Docs
-
-Updated `examples/train_cfr.py` so the formal training example now uses the prefix-branch pipeline and reports:
-
-- `prefix_branch: true`,
-- iteration count,
-- information-set count,
-- number of action-conditioned training samples,
-- a small sample preview.
-
-Updated the README CFR section to state that integer `raise_to(total)` actions are first-class actions in the new prefix-branch path, while pot and stack ratios are continuous embedding features rather than fixed action labels.
-
-## Verification
-
-Added `tests/test_prefix_branch_training.py` with coverage for:
-
-- arbitrary legal integer raises are sampled and preserved,
-- required/user-entered legal integer raises survive even with a small sample budget,
-- nearby integer bets produce nearby action embeddings,
-- prefix branch expansion does not mutate the original table,
-- embedding coverage marks repeated regions as less novel,
-- neighbor smoothing is disabled by default,
-- trainer nodes only track actually expanded branches,
-- the training example uses the prefix-branch pipeline.
-
-Verification commands run successfully:
-
-```bash
-python3.13 -B -c 'import sys, unittest; sys.path.insert(0, "/Users/sunyihao/Desktop/poker"); sys.path.insert(0, "/Users/sunyihao/Desktop/poker/src"); suite=unittest.defaultTestLoader.discover("/Users/sunyihao/Desktop/poker/tests"); result=unittest.TextTestRunner(verbosity=1).run(suite); raise SystemExit(0 if result.wasSuccessful() else 1)'
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/train_rtx5070ti.ps1 -Iterations 10000
 ```
 
-Result: `46 tests OK`.
-
-```bash
-python3.13 -m compileall /Users/sunyihao/Desktop/poker/src /Users/sunyihao/Desktop/poker/examples /Users/sunyihao/Desktop/poker/tests
-```
-
-Result: compile check passed.
-
-```bash
-python3.13 -B /Users/sunyihao/Desktop/poker/examples/train_cfr.py
-```
-
-Result: example ran successfully and produced prefix-branch training samples.
-
-## Current Boundary
-
-The implemented work adds the integer-action prefix-branch training scaffold and action-conditioned sample generation. It does not yet add a Torch/GPU value or regret network. The new `ActionTrainingSample` records are the bridge to that next Deep CFR-style learned inference step.
-
-## Recommended Next Step
-
-Add the learned action-conditioned model that consumes `(state_features, trajectory_embedding, action_embedding)` and trains on the collected `ActionTrainingSample` targets. That is the point where GPU batching should become central: branch generation remains engine-side, while scoring and training many concrete integer actions can run as large tensor batches.
+The script defaults to `runs/poker_policy_gpu.pt` and
+`runs/training_summary_gpu.json`, so it does not overwrite the prior CPU-rollout
+checkpoint unless an existing output path is explicitly supplied.

@@ -6,10 +6,11 @@ import random
 from typing import Any, Iterable, Mapping, Sequence
 
 from poker_arena.actions import Action, ActionType
+from poker_arena.cards import Card
 from poker_arena.state import HandState, PlayerHandView, Street
 
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 
 
 try:  # pragma: no cover - import branch depends on optional dependency.
@@ -31,7 +32,10 @@ class StateFeatureEncoder:
 
     max_seats = 9
     street_values = (Street.PREFLOP.value, Street.FLOP.value, Street.TURN.value, Street.RIVER.value, Street.SHOWDOWN.value)
-    dimension = 31
+    base_dimension = 31
+    card_dimension = 52
+    dimension = base_dimension + card_dimension * 2
+    suit_offsets = {"c": 0, "d": 13, "h": 26, "s": 39}
 
     def encode_state(self, state: HandState, actor: int) -> list[float]:
         actor_player = state.player_by_seat(actor)
@@ -50,6 +54,8 @@ class StateFeatureEncoder:
             folded=folded,
             all_in=all_in,
             board_count=len(state.board),
+            hole_cards=actor_player.hole_cards,
+            board=state.board,
         )
 
     def encode_view(self, view: PlayerHandView | None, legal_actions: Any) -> list[float]:
@@ -66,11 +72,15 @@ class StateFeatureEncoder:
                 folded=[],
                 all_in=[],
                 board_count=0,
+                hole_cards=[],
+                board=[],
             )
         stacks = [view.stacks[seat] for seat in sorted(view.stacks)]
         folded = [1.0 if view.folded[seat] else 0.0 for seat in sorted(view.folded)]
+        all_in = [1.0 if view.all_in[seat] else 0.0 for seat in sorted(view.all_in)]
         actor = view.current_actor if view.current_actor is not None else 0
         actor_stack = view.stacks.get(actor, max(stacks) if stacks else 1)
+        hole_cards = next((cards for cards in view.hole_cards.values() if cards is not None), ())
         return self._encode(
             seats=len(stacks),
             actor=actor,
@@ -81,8 +91,10 @@ class StateFeatureEncoder:
             actor_stack=actor_stack,
             stacks=stacks,
             folded=folded,
-            all_in=[],
+            all_in=all_in,
             board_count=len(view.board),
+            hole_cards=hole_cards,
+            board=view.board,
         )
 
     def _encode(
@@ -98,8 +110,10 @@ class StateFeatureEncoder:
         folded: Sequence[float],
         all_in: Sequence[float],
         board_count: int,
+        hole_cards: Sequence[Card],
+        board: Sequence[Card],
     ) -> list[float]:
-        denom = max(1.0, float(pot + sum(stacks) + actor_stack))
+        denom = max(1.0, float(pot + sum(stacks)), float(pot + actor_stack))
         features: list[float] = [
             seats / self.max_seats,
             actor / max(1, self.max_seats - 1),
@@ -115,8 +129,18 @@ class StateFeatureEncoder:
         features.extend(stack / denom for stack in padded_stacks)
         features.extend(padded_folded)
         features.append(sum(all_in) / max(1, seats))
+        features.extend(self._encode_cards(hole_cards))
+        features.extend(self._encode_cards(board))
         if len(features) != self.dimension:
             raise AssertionError(f"State feature dimension changed: {len(features)} != {self.dimension}")
+        return features
+
+    @classmethod
+    def _encode_cards(cls, cards: Sequence[Card]) -> list[float]:
+        features = [0.0] * cls.card_dimension
+        for card in cards:
+            index = cls.suit_offsets[card.suit.value] + int(card.rank) - 2
+            features[index] = 1.0
         return features
 
 
@@ -213,6 +237,8 @@ class TorchReplayBuffer:
         return len(self.samples)
 
     def batches(self, batch_size: int, shuffle: bool = True, seed: int | None = None) -> Iterable[list[TorchTrainingSample]]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
         indices = list(range(len(self.samples)))
         if shuffle:
             random.Random(seed).shuffle(indices)
@@ -234,25 +260,51 @@ def train_value_model(
     epochs: int,
     batch_size: int,
     learning_rate: float,
+    use_amp: bool = False,
 ) -> dict[str, Any]:
     torch_module = _require_torch()
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if learning_rate <= 0:
+        raise ValueError("learning_rate must be positive")
+    if len(buffer) == 0:
+        raise ValueError("Cannot train from an empty replay buffer")
     model.to(device)
     model.train()
+    device_type = getattr(device, "type", str(device).split(":", 1)[0])
+    amp_enabled = bool(use_amp and device_type == "cuda")
+    amp_dtype = torch_module.bfloat16 if amp_enabled and torch_module.cuda.is_bf16_supported() else torch_module.float16
+    scaler = torch_module.amp.GradScaler("cuda", enabled=amp_enabled and amp_dtype == torch_module.float16)
+    if device_type == "cuda":
+        torch_module.set_float32_matmul_precision("high")
     optimizer = torch_module.optim.AdamW(model.parameters(), lr=learning_rate)
     losses: list[float] = []
     for epoch in range(epochs):
         epoch_losses: list[float] = []
         for batch in buffer.batches(batch_size=batch_size, shuffle=True, seed=epoch):
             x, y, w = buffer.tensors_for(batch, device)
-            pred = model(x)
-            loss = (((pred - y) ** 2) * w).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with torch_module.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
+                pred = model(x)
+                loss = (((pred - y) ** 2) * w).mean()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             epoch_losses.append(float(loss.detach().cpu().item()))
         if epoch_losses:
             losses.append(sum(epoch_losses) / len(epoch_losses))
-    return {"loss": losses, "samples": len(buffer), "epochs": epochs}
+    return {
+        "loss": losses,
+        "samples": len(buffer),
+        "epochs": epochs,
+        "device": str(device),
+        "amp": amp_enabled,
+        "amp_dtype": str(amp_dtype).removeprefix("torch.") if amp_enabled else None,
+    }
 
 
 def build_checkpoint_payload(

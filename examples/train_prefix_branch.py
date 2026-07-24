@@ -12,9 +12,6 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from poker_arena.cfr import PrefixBranchCFRTrainer, PrefixBranchTrainingConfig  # noqa: E402
-from poker_arena.table import TableConfig  # noqa: E402
-
 
 def parse_gpu_ids(raw: str | None) -> tuple[int, ...]:
     if raw is None:
@@ -67,13 +64,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=101)
     parser.add_argument("--random-seed", type=int, default=17)
     parser.add_argument("--branch-width", type=int, default=32)
-    parser.add_argument("--branch-depth", type=int, default=8)
+    parser.add_argument("--branch-depth", type=int, default=0, help="Rollout depth; 0 continues each branch to a terminal state.")
     parser.add_argument("--integer-action-budget", type=int, default=32)
     parser.add_argument("--novelty-weight", type=float, default=1.0)
     parser.add_argument("--neighbor-weight", type=float, default=0.0)
     parser.add_argument("--required-integer-actions", default="")
     parser.add_argument("--max-actions-per-episode", type=int, default=200)
     parser.add_argument("--max-workers", type=int, default=1)
+    parser.add_argument("--coverage-capacity", type=int, default=4096)
+    parser.add_argument("--replay-capacity", type=int, default=50_000)
+    parser.add_argument("--log-every", type=int, default=10, help="Print progress every N iterations; 0 disables progress output.")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cpu")
     parser.add_argument("--gpus", default="none", help="Comma-separated CUDA GPU ids, e.g. 0 or 0,1. Use 'none' for CPU.")
     parser.add_argument("--output", type=Path, default=None, help="Optional JSON summary path.")
@@ -84,6 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
 def run_from_args(args: argparse.Namespace, env: MutableMapping[str, str] | None = None) -> dict[str, object]:
     gpu_ids = parse_gpu_ids(args.gpus)
     configure_visible_gpus(gpu_ids, env)
+    from poker_arena.cfr import PrefixBranchCFRTrainer, PrefixBranchTrainingConfig  # noqa: PLC0415
+    from poker_arena.table import TableConfig  # noqa: PLC0415
+
     required_amounts = parse_required_amounts(args.required_integer_actions)
     config = PrefixBranchTrainingConfig(
         branch_width=args.branch_width,
@@ -95,6 +98,8 @@ def run_from_args(args: argparse.Namespace, env: MutableMapping[str, str] | None
         max_actions_per_episode=args.max_actions_per_episode,
         random_seed=args.random_seed,
         max_workers=args.max_workers,
+        coverage_capacity=args.coverage_capacity,
+        replay_capacity=args.replay_capacity,
     )
     trainer = PrefixBranchCFRTrainer(
         table_config=TableConfig(
@@ -106,7 +111,11 @@ def run_from_args(args: argparse.Namespace, env: MutableMapping[str, str] | None
         ),
         config=config,
     )
-    result = trainer.train(iterations=args.iterations)
+    def progress(done: int, total: int, samples_seen: int) -> None:
+        if args.log_every > 0 and (done == 1 or done == total or done % args.log_every == 0):
+            print(f"rollouts: {done}/{total} iterations, {samples_seen} samples generated", file=sys.stderr)
+
+    result = trainer.train(iterations=args.iterations, progress_callback=progress)
     preview = [
         {
             "infoset": sample.infoset_key,
@@ -125,10 +134,13 @@ def run_from_args(args: argparse.Namespace, env: MutableMapping[str, str] | None
         "information_sets": result.information_sets,
         "episodes": result.episodes,
         "training_samples": len(trainer.training_samples),
+        "generated_samples": trainer.samples_seen,
         "branch_width": config.branch_width,
         "branch_depth": config.branch_depth,
         "integer_action_budget": config.integer_action_budget,
         "max_workers": config.max_workers,
+        "coverage_capacity": config.coverage_capacity,
+        "replay_capacity": config.replay_capacity,
         "required_integer_actions": list(required_amounts),
         "sample_preview": preview,
     }

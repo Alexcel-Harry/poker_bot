@@ -36,6 +36,19 @@ class TorchTrainingPurePythonTests(unittest.TestCase):
 
         self.assertEqual(len(features), encoder.dimension)
         self.assertGreater(sum(abs(value) for value in features), 0.0)
+        self.assertEqual(features, encoder.encode_view(state.player_view(actor), state.legal_actions(actor)))
+
+    def test_state_features_include_private_and_board_card_identities(self):
+        encoder = StateFeatureEncoder()
+        first = Table(TableConfig(seats=3, small_blind=10, big_blind=20, starting_stacks=[200, 200, 200], seed=1))
+        second = Table(TableConfig(seats=3, small_blind=10, big_blind=20, starting_stacks=[200, 200, 200], seed=2))
+        first_state = first.start_hand()
+        second_state = second.start_hand()
+
+        first_features = encoder.encode_state(first_state, first_state.current_actor)
+        second_features = encoder.encode_state(second_state, second_state.current_actor)
+
+        self.assertNotEqual(first_features, second_features)
 
     def test_checkpoint_metadata_validates_required_fields(self):
         metadata = TorchCheckpointMetadata(
@@ -112,13 +125,16 @@ class TorchTrainingWithTorchTests(unittest.TestCase):
             train_value_model,
         )
 
+        state_dim = StateFeatureEncoder.dimension
+        trajectory_dim = 14
+        action_dim = ActionEmbedding.dimension_without_trajectory
         samples = [
-            TorchTrainingSample([0.0, 0.1], [0.2], [0.3], {"type": "fold", "total": None}, -1.0, 1.0),
-            TorchTrainingSample([0.1, 0.2], [0.3], [0.4], {"type": "call", "total": None}, 1.0, 1.0),
-            TorchTrainingSample([0.2, 0.3], [0.4], [0.5], {"type": "raise_to", "total": 123}, 2.0, 1.0),
+            TorchTrainingSample([0.0] * state_dim, [0.0] * trajectory_dim, [0.0] * action_dim, {"type": "fold", "total": None}, -1.0, 1.0),
+            TorchTrainingSample([0.1] * state_dim, [0.1] * trajectory_dim, [0.1] * action_dim, {"type": "call", "total": None}, 1.0, 1.0),
+            TorchTrainingSample([0.2] * state_dim, [0.2] * trajectory_dim, [0.2] * action_dim, {"type": "raise_to", "total": 123}, 2.0, 1.0),
         ]
         buffer = TorchReplayBuffer(samples)
-        model = ActionValueNet(input_dim=4, hidden=(8,))
+        model = ActionValueNet(input_dim=state_dim + trajectory_dim + action_dim, hidden=(8,))
         before = {name: value.detach().clone() for name, value in model.state_dict().items()}
 
         stats = train_value_model(model, buffer, device=torch.device("cpu"), epochs=2, batch_size=2, learning_rate=0.01)
@@ -127,8 +143,9 @@ class TorchTrainingWithTorchTests(unittest.TestCase):
         self.assertTrue(any(not torch.equal(before[name], value) for name, value in model.state_dict().items()))
 
         metadata = TorchCheckpointMetadata(
-            state_dim=2,
-            action_dim=2,
+            state_dim=state_dim,
+            trajectory_dim=trajectory_dim,
+            action_dim=action_dim,
             hidden=(8,),
             dropout=0.0,
             table_defaults={"seats": 3},

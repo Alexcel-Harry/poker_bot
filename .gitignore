@@ -1,4 +1,10 @@
 .venv/
 __MACOSX/
-*/__pycache__/
-**/__pycache__/
+.DS_Store
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+runs/

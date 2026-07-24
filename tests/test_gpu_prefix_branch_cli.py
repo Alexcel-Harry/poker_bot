@@ -1,87 +1,71 @@
-import importlib.util
+from contextlib import redirect_stderr
+import io
+import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
-from examples.train_gpu_prefix_branch import build_parser, parse_gpu_ids
-
-
-TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
+from examples.train_gpu_prefix_branch import (
+    _require_single_cuda_gpu,
+    build_parser,
+    parse_hidden,
+)
 
 
 class GpuPrefixBranchCliTests(unittest.TestCase):
-    def test_gpu_parser_accepts_cpu_single_gpu_and_multi_gpu(self):
-        self.assertEqual(parse_gpu_ids("none"), ())
-        self.assertEqual(parse_gpu_ids("0"), (0,))
-        self.assertEqual(parse_gpu_ids("0,1"), (0, 1))
+    def test_defaults_describe_a_cuda_tensorized_10k_run(self):
+        args = build_parser().parse_args([])
 
-    def test_build_parser_accepts_model_output(self):
+        self.assertEqual(args.device, "cuda")
+        self.assertEqual(args.gpus, "0")
+        self.assertEqual(args.iterations, 10_000)
+        self.assertEqual(args.parallel_hands, 1024)
+        self.assertEqual(args.branch_width, 32)
+
+    def test_cpu_and_no_gpu_are_rejected_by_the_parser_or_validator(self):
         parser = build_parser()
-        args = parser.parse_args(["--device", "cpu", "--gpus", "none", "--model-out", "runs/policy.pt"])
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            parser.parse_args(["--device", "cpu"])
 
-        self.assertEqual(args.device, "cpu")
-        self.assertEqual(args.gpus, "none")
-        self.assertEqual(args.model_out, Path("runs/policy.pt"))
+        args = parser.parse_args(["--gpus", "none"])
+        with self.assertRaises(ValueError):
+            _require_single_cuda_gpu(args, {})
 
-    def test_script_help_runs_when_called_by_path(self):
+    def test_exactly_one_visible_gpu_is_configured_before_torch_import(self):
+        args = build_parser().parse_args(["--gpus", "2"])
+        environment: dict[str, str] = {}
+
+        ids = _require_single_cuda_gpu(args, environment)
+
+        self.assertEqual(ids, (2,))
+        self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "2")
+
+    def test_multiple_gpu_ids_are_rejected(self):
+        args = build_parser().parse_args(["--gpus", "0,1"])
+        with self.assertRaises(ValueError):
+            _require_single_cuda_gpu(args, {})
+
+    def test_hidden_parser_validates_widths(self):
+        self.assertEqual(parse_hidden("64, 32"), (64, 32))
+        with self.assertRaises(ValueError):
+            parse_hidden("64,0")
+
+    def test_script_help_does_not_initialize_cuda_or_start_training(self):
+        environment = dict(os.environ)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         result = subprocess.run(
             [sys.executable, "-B", "examples/train_gpu_prefix_branch.py", "--help"],
             cwd=Path(__file__).resolve().parents[1],
+            env=environment,
             capture_output=True,
             text=True,
             check=False,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--model-out", result.stdout)
-
-    @unittest.skipUnless(TORCH_AVAILABLE, "torch is not installed")
-    def test_tiny_gpu_training_cli_writes_pt_and_summary(self):
-        from examples.train_gpu_prefix_branch import run_from_args
-        from poker_arena.bots import TorchPolicyBot
-
-        parser = build_parser()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            model_out = Path(tmpdir) / "policy.pt"
-            summary_out = Path(tmpdir) / "summary.json"
-            args = parser.parse_args(
-                [
-                    "--iterations",
-                    "1",
-                    "--branch-width",
-                    "2",
-                    "--branch-depth",
-                    "1",
-                    "--integer-action-budget",
-                    "4",
-                    "--max-actions-per-episode",
-                    "2",
-                    "--starting-stack",
-                    "200",
-                    "--epochs",
-                    "1",
-                    "--batch-size",
-                    "2",
-                    "--device",
-                    "cpu",
-                    "--gpus",
-                    "none",
-                    "--model-out",
-                    str(model_out),
-                    "--summary-out",
-                    str(summary_out),
-                ]
-            )
-
-            summary = run_from_args(args, env={})
-
-            self.assertTrue(model_out.exists())
-            self.assertTrue(summary_out.exists())
-            self.assertEqual(summary["model_out"], str(model_out))
-            self.assertGreater(summary["training_samples"], 0)
-            self.assertIsNotNone(TorchPolicyBot.from_checkpoint(model_out, device="cpu"))
+        self.assertIn("--parallel-hands", result.stdout)
+        self.assertIn("CPU fallback is intentionally unavailable", result.stdout)
 
 
 if __name__ == "__main__":

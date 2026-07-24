@@ -244,14 +244,14 @@ h2 {
 }
 
 .seat[data-seat="0"] { left: calc(50% - 67px); top: 18px; }
-.seat[data-seat="1"] { right: 13%; top: 72px; }
-.seat[data-seat="2"] { right: 3%; top: 245px; }
-.seat[data-seat="3"] { right: 12%; bottom: 86px; }
-.seat[data-seat="4"] { left: calc(50% - 67px); bottom: 24px; }
-.seat[data-seat="5"] { left: 12%; bottom: 86px; }
-.seat[data-seat="6"] { left: 3%; top: 245px; }
-.seat[data-seat="7"] { left: 13%; top: 72px; }
-.seat[data-seat="8"] { left: calc(50% - 67px); top: 42%; }
+.seat[data-seat="1"] { right: 18%; top: 72px; }
+.seat[data-seat="2"] { right: 3%; top: 230px; }
+.seat[data-seat="3"] { right: 5%; bottom: 115px; }
+.seat[data-seat="4"] { right: 28%; bottom: 24px; }
+.seat[data-seat="5"] { left: 28%; bottom: 24px; }
+.seat[data-seat="6"] { left: 5%; bottom: 115px; }
+.seat[data-seat="7"] { left: 3%; top: 230px; }
+.seat[data-seat="8"] { left: 18%; top: 72px; }
 
 .board-center {
   position: absolute;

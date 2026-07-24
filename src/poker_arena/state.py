@@ -56,6 +56,7 @@ class PublicHandView:
     pot: int
     stacks: dict[int, int]
     folded: dict[int, bool]
+    all_in: dict[int, bool]
     hole_cards: dict[int, tuple[Card, ...]]
     events: tuple[PokerEvent, ...]
 
@@ -68,6 +69,7 @@ class PublicHandView:
             "pot": self.pot,
             "stacks": self.stacks,
             "folded": self.folded,
+            "all_in": self.all_in,
             "hole_cards": {seat: [card.to_str() for card in cards] for seat, cards in self.hole_cards.items()},
             "events": [event.to_dict() for event in self.events],
         }
@@ -137,6 +139,7 @@ class HandState:
             pot=self.total_pot,
             stacks={player.seat_id: player.stack for player in self.players},
             folded={player.seat_id: player.folded for player in self.players},
+            all_in={player.seat_id: player.all_in for player in self.players},
             hole_cards={},
             events=tuple(event for event in self.events if event.event_type != "snapshot"),
         )
@@ -153,6 +156,7 @@ class HandState:
             pot=self.total_pot,
             stacks={player.seat_id: player.stack for player in self.players},
             folded={player.seat_id: player.folded for player in self.players},
+            all_in={player.seat_id: player.all_in for player in self.players},
             hole_cards=hole_cards,
             events=tuple(event for event in self.events if event.event_type != "snapshot"),
         )

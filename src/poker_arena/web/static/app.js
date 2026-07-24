@@ -5,6 +5,8 @@ const state = {
   hostToken: localStorage.getItem("pokerArenaHostToken") || "",
 };
 
+const INVALID_SEAT_TOKEN_CLOSE_CODE = 4401;
+
 const params = new URLSearchParams(window.location.search);
 if (params.get("room_code")) {
   document.addEventListener("DOMContentLoaded", () => {
@@ -25,8 +27,14 @@ function connect() {
   const socket = new WebSocket(`${protocol}://${window.location.host}/ws${tokenQuery}`);
   state.socket = socket;
   socket.addEventListener("open", () => setConnection("online"));
-  socket.addEventListener("close", () => {
-    setConnection("offline");
+  socket.addEventListener("close", (event) => {
+    if (event.code === INVALID_SEAT_TOKEN_CLOSE_CODE) {
+      state.seatToken = null;
+      localStorage.removeItem("pokerArenaSeatToken");
+      setConnection("reconnecting");
+    } else {
+      setConnection("offline");
+    }
     setTimeout(connect, 1200);
   });
   socket.addEventListener("message", (event) => {
@@ -53,7 +61,7 @@ function render() {
   document.getElementById("roomTitle").textContent = `Room ${snap.room_code}`;
   document.getElementById("gameStatus").textContent = snap.paused_reason || snap.status;
   document.getElementById("blindStatus").textContent = `${snap.settings.small_blind} / ${snap.settings.big_blind}`;
-  document.getElementById("roomCodeInput").value ||= snap.room_code;
+  document.getElementById("roomCodeInput").value = snap.room_code;
 
   renderSeatOptions();
   renderSeats();

@@ -69,6 +69,7 @@ class PrefixBranchTrainingTests(unittest.TestCase):
         self.assertEqual([result.action for result in results], actions)
         self.assertTrue(all(len(result.utilities) == table.config.seats for result in results))
         self.assertTrue(all(result.action_embedding for result in results))
+        self.assertTrue(all(abs(sum(result.utilities)) < 1e-9 for result in results))
 
     def test_embedding_coverage_scores_seen_regions_as_less_novel(self):
         _table, state, actor = self.betting_state()
@@ -83,6 +84,16 @@ class PrefixBranchTrainingTests(unittest.TestCase):
         novel_after = coverage.novelty(vector)
 
         self.assertGreater(novel_before, novel_after)
+
+    def test_embedding_coverage_is_bounded(self):
+        coverage = EmbeddingCoverageIndex(max_vectors=2)
+
+        coverage.record([0.0])
+        coverage.record([1.0])
+        coverage.record([2.0])
+
+        self.assertEqual(len(coverage.vectors), 2)
+        self.assertIn([2.0], coverage.vectors)
 
     def test_prefix_branch_trainer_smoke_uses_neighbor_smoothing_disabled_by_default(self):
         config = PrefixBranchTrainingConfig(
@@ -103,6 +114,14 @@ class PrefixBranchTrainingTests(unittest.TestCase):
         self.assertEqual(result.iterations, 2)
         self.assertGreater(result.episodes, 0)
         self.assertTrue(trainer.training_samples)
+        self.assertTrue(all(-1.0 <= sample.target_utility <= 2.0 for sample in trainer.torch_training_samples))
+
+    def test_terminal_rollouts_are_the_safe_default(self):
+        config = PrefixBranchTrainingConfig()
+
+        self.assertEqual(config.branch_depth, 0)
+        with self.assertRaises(ValueError):
+            PrefixBranchTrainingConfig(branch_width=0)
 
     def test_prefix_branch_trainer_only_tracks_actions_that_are_expanded(self):
         config = PrefixBranchTrainingConfig(
