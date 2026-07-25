@@ -108,6 +108,23 @@ class TableBettingTests(unittest.TestCase):
         self.assertEqual(len(state.board), 5)
         self.assertTrue(any(event.event_type == "street_dealt" and event.data["street"] == "river" for event in state.events))
 
+    def test_uncalled_all_in_excess_is_returned_instead_of_reported_as_a_pot_win(self):
+        table = Table(TableConfig(seats=3, small_blind=10, big_blind=20, starting_stacks=[100, 200, 300], seed=9))
+        table.start_hand()
+
+        table.apply(Action.raise_to(100))
+        table.apply(Action.raise_to(200))
+        state = table.apply(Action.raise_to(300))
+
+        returns = [event for event in state.events if event.event_type == "uncalled_bet_returned"]
+        awards = [event for event in state.events if event.event_type == "pot_awarded"]
+        self.assertTrue(state.is_terminal)
+        self.assertEqual([(event.data["seat_id"], event.data["amount"]) for event in returns], [(2, 100)])
+        self.assertEqual([pot.amount for pot in state.pots], [300, 200])
+        self.assertEqual(sum(int(event.data["amount"]) for event in awards), 500)
+        self.assertEqual({event.data["pot_type"] for event in awards}, {"main", "side"})
+        self.assertEqual(sum(player.stack for player in state.players), 600)
+
 
 class SidePotCarryoverTests(unittest.TestCase):
     def test_odd_chip_remainder_carries_to_next_hand(self):

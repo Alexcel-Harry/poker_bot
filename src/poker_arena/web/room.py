@@ -182,7 +182,7 @@ class PokerRoom:
             street = public_view.street.value
             pot = public_view.pot
             current_bet = hand.current_bet
-            log_events = [event.to_dict() for event in public_view.events][-40:]
+            log_events = [self._event_for_display(event) for event in public_view.events][-40:]
             if self.reveal_all_hole_cards:
                 for engine_seat, display_seat in self.engine_to_display.items():
                     revealed_hole_cards[display_seat] = [
@@ -227,6 +227,7 @@ class PokerRoom:
             hands.append(self._hand_record(self.table.current_hand))
         return {
             "room_code": self.room_code,
+            "seat_id_space": "display",
             "settings": {"starting_stack": STARTING_STACK, "small_blind": SMALL_BLIND, "big_blind": BIG_BLIND},
             "seats": [seat.public_dict() for seat in self.seats],
             "hands": hands,
@@ -293,8 +294,37 @@ class PokerRoom:
             "button": self.engine_to_display.get(state.button),
             "board": [card.to_str() for card in state.board],
             "hole_cards": hole_cards,
-            "events": [event.to_dict() for event in state.events if event.event_type != "snapshot"],
+            "events": [
+                self._event_for_display(event)
+                for event in state.events
+                if event.event_type != "snapshot"
+            ],
         }
+
+    def _event_for_display(self, event: PokerEvent) -> dict[str, Any]:
+        data = dict(event.data)
+        seat_fields = ("button", "small_blind_seat", "big_blind_seat") if event.event_type == "hand_started" else ("seat_id",)
+        for field in seat_fields:
+            value = data.get(field)
+            if isinstance(value, int):
+                data[field] = self.engine_to_display.get(value, value)
+
+        eligible = data.get("eligible_seats")
+        if isinstance(eligible, list):
+            data["eligible_seats"] = [
+                self.engine_to_display.get(seat_id, seat_id)
+                for seat_id in eligible
+                if isinstance(seat_id, int)
+            ]
+
+        stacks = data.get("stacks")
+        if event.event_type == "hand_finished" and isinstance(stacks, list):
+            data["stacks_by_seat"] = [
+                {"seat_id": self.engine_to_display.get(engine_seat, engine_seat), "stack": stack}
+                for engine_seat, stack in enumerate(stacks)
+            ]
+
+        return {"event_type": event.event_type, "data": data}
 
     def _seat_payloads(self) -> list[dict[str, Any]]:
         payloads = []

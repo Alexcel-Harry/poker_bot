@@ -250,12 +250,15 @@ class Table:
 
     def _showdown(self, state: HandState) -> None:
         state.street = Street.SHOWDOWN
-        state.pots = self._build_pots(state)
+        state.pots, uncalled_returns = self._build_pots(state)
+        for seat_id, amount in uncalled_returns:
+            state.player_by_seat(seat_id).stack += amount
+            state.events.append(PokerEvent("uncalled_bet_returned", {"seat_id": seat_id, "amount": amount}))
         values = {
             seat_id: evaluate_best(state.player_by_seat(seat_id).hole_cards + state.board)
             for seat_id in live_seats(state)
         }
-        for pot in state.pots:
+        for pot_index, pot in enumerate(state.pots):
             eligible = [seat for seat in pot.eligible_seats if seat in values]
             best = max(values[seat] for seat in eligible)
             winners = [seat for seat in eligible if values[seat] == best]
@@ -263,7 +266,21 @@ class Table:
             remainder = pot.amount % len(winners)
             for winner in winners:
                 state.player_by_seat(winner).stack += share
-                state.events.append(PokerEvent("pot_awarded", {"seat_id": winner, "amount": share, "showdown": True}))
+                state.events.append(
+                    PokerEvent(
+                        "pot_awarded",
+                        {
+                            "seat_id": winner,
+                            "amount": share,
+                            "showdown": True,
+                            "pot_index": pot_index,
+                            "pot_type": "main" if pot_index == 0 else "side",
+                            "pot_amount": pot.amount,
+                            "eligible_seats": list(pot.eligible_seats),
+                            "winner_count": len(winners),
+                        },
+                    )
+                )
             if remainder:
                 self.carryover_chips += remainder
                 state.events.append(PokerEvent("odd_chip_carryover", {"amount": remainder}))
@@ -276,17 +293,20 @@ class Table:
             self.stacks[player.seat_id] = player.stack
         state.events.append(PokerEvent("hand_finished", {"stacks": list(self.stacks), "carryover_chips": self.carryover_chips}))
 
-    def _build_pots(self, state: HandState) -> list[Pot]:
+    def _build_pots(self, state: HandState) -> tuple[list[Pot], list[tuple[int, int]]]:
         contributions = {seat: amount for seat, amount in state.total_committed.items() if amount > 0}
         if not contributions and state.carryover_in_pot:
-            return [Pot(state.carryover_in_pot, tuple(live_seats(state)))]
+            return [Pot(state.carryover_in_pot, tuple(live_seats(state)))], []
         pots: list[Pot] = []
+        uncalled_returns: list[tuple[int, int]] = []
         previous = 0
         for level in sorted(set(contributions.values())):
             contributors = [seat for seat, amount in contributions.items() if amount >= level]
             amount = (level - previous) * len(contributors)
             eligible = tuple(seat for seat in contributors if not state.player_by_seat(seat).folded)
-            if amount and eligible:
+            if amount and len(contributors) == 1:
+                uncalled_returns.append((contributors[0], amount))
+            elif amount and eligible:
                 pots.append(Pot(amount, eligible))
             previous = level
         if state.carryover_in_pot:
@@ -295,7 +315,7 @@ class Table:
                 pots[0] = Pot(first.amount + state.carryover_in_pot, first.eligible_seats)
             else:
                 pots.append(Pot(state.carryover_in_pot, tuple(live_seats(state))))
-        return pots
+        return pots, uncalled_returns
 
     def _append_snapshot(self, state: HandState) -> None:
         state.events.append(PokerEvent("snapshot", {"state": state.to_snapshot()}))

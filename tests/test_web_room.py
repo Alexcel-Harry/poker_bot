@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from poker_arena import Action, CheckCallBot
 from poker_arena.web.bot_loader import bot_policy_factory_from_env
+from poker_arena.web.__main__ import build_parser
 from poker_arena.web.room import PokerRoom
 
 
@@ -179,6 +180,26 @@ class PokerRoomPlayTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             room.session_log(host_token="bad-token")
 
+    def test_log_events_keep_display_seat_ids_when_an_earlier_seat_is_inactive(self):
+        room = PokerRoom(seed=7)
+        ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+        room.join(room_code=room.room_code, seat_id=2, nickname="Grace")
+
+        room.submit_action(seat_token=ada["seat_token"], action=Action.fold())
+        log = room.session_log(host_token=room.host_token)
+        events = log["hands"][0]["events"]
+        hand_started = next(event for event in events if event["event_type"] == "hand_started")
+        big_blind = next(event for event in events if event["event_type"] == "big_blind")
+        award = next(event for event in events if event["event_type"] == "pot_awarded")
+        finished = next(event for event in events if event["event_type"] == "hand_finished")
+
+        self.assertEqual(log["seat_id_space"], "display")
+        self.assertEqual(hand_started["data"]["big_blind_seat"], 2)
+        self.assertEqual(big_blind["data"]["seat_id"], 2)
+        self.assertEqual(award["data"]["seat_id"], 2)
+        self.assertEqual([item["seat_id"] for item in finished["data"]["stacks_by_seat"]], [0, 2])
+        self.assertEqual([player["seat_id"] for player in log["hands"][0]["hole_cards"]], [0, 2])
+
     def test_debug_reveal_exposes_all_hole_cards_in_snapshot(self):
         room = PokerRoom(seed=7, reveal_all_hole_cards=True)
         ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
@@ -264,8 +285,29 @@ class StaticAppTests(unittest.TestCase):
         self.assertIn("submitQuickRaise", app_js)
         self.assertIn("submitCustomRaise", app_js)
         self.assertIn("debug cards: ON", app_js)
+        self.assertIn("uncalled bet returned", app_js)
         self.assertNotIn("if (!hostToken) return", app_js)
-        self.assertIn("app.js?v=20260725-debug-cards-1", index)
+        self.assertIn("app.js?v=20260725-pot-audit-1", index)
+
+    def test_web_cli_accepts_explicit_model_device_and_reveal_settings(self):
+        args = build_parser().parse_args(
+            ["--model", "runs/custom.pt", "--device", "cuda", "--no-reveal-cards", "--port", "8123"]
+        )
+
+        self.assertEqual(args.model, Path("runs/custom.pt"))
+        self.assertEqual(args.device, "cuda")
+        self.assertFalse(args.reveal_cards)
+        self.assertEqual(args.port, 8123)
+
+    def test_windows_launcher_does_not_modify_powershell_environment(self):
+        launcher = Path(__file__).resolve().parents[1] / "scripts" / "run_poker_arena.ps1"
+        script = launcher.read_text()
+
+        self.assertIn('"--model", $resolvedModel', script)
+        self.assertIn('"--device", $Device', script)
+        self.assertIn('"--reveal-cards"', script)
+        self.assertNotIn("$env:", script.lower())
+        self.assertNotIn("POKER_BOT_MODEL", script)
 
 
 class HostSessionRecoveryTests(unittest.IsolatedAsyncioTestCase):

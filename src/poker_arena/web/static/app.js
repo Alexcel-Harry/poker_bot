@@ -209,7 +209,16 @@ function formatEvent(event, currentBet) {
     return { text: `Seat ${data.seat_id + 1}: ${data.action.type}`, currentBet };
   }
   if (event.event_type === "street_dealt") return { text: `${data.street}: ${(data.board || []).join(" ")}`, currentBet: 0 };
-  if (event.event_type === "pot_awarded") return { text: `Seat ${data.seat_id + 1} won ${data.amount}`, currentBet };
+  if (event.event_type === "uncalled_bet_returned") {
+    return { text: `Seat ${data.seat_id + 1}: uncalled bet returned ${data.amount}`, currentBet };
+  }
+  if (event.event_type === "pot_awarded") {
+    if (data.showdown && data.pot_type) {
+      const splitLabel = Number(data.winner_count) > 1 ? " share" : "";
+      return { text: `Seat ${data.seat_id + 1} won ${data.amount}${splitLabel} from the ${data.pot_type} pot`, currentBet };
+    }
+    return { text: `Seat ${data.seat_id + 1} won ${data.amount}`, currentBet };
+  }
   if (event.event_type === "hand_started") return { text: `Hand ${data.hand_number}`, currentBet: 0 };
   return { text: event.event_type.replaceAll("_", " "), currentBet };
 }

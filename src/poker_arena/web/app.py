@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from poker_arena.actions import Action
-from poker_arena.web.bot_loader import bot_policy_factory_from_env
+from poker_arena.web.bot_loader import bot_policy_factory, bot_policy_factory_from_env
 from poker_arena.web.room import PokerRoom
 
 try:
@@ -31,6 +31,19 @@ room = PokerRoom(
     bot_policy_factory=bot_policy_factory_from_env(),
     reveal_all_hole_cards=REVEAL_ALL_HOLE_CARDS,
 )
+
+
+def configure_room(model_path: str | os.PathLike[str] | None, device: str, reveal_all_hole_cards: bool) -> PokerRoom:
+    """Replace the startup room using explicit process arguments."""
+
+    global room
+    room = PokerRoom(
+        bot_policy_factory=bot_policy_factory(model_path, device=device),
+        reveal_all_hole_cards=reveal_all_hole_cards,
+    )
+    return room
+
+
 app = FastAPI(title="Poker Arena")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
