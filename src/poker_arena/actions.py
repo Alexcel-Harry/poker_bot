@@ -66,6 +66,7 @@ class LegalActions:
             "can_fold": self.can_fold,
             "can_check": self.can_check,
             "can_call": self.can_call,
+            "can_raise": self.can_raise,
             "call_amount": self.call_amount,
             "min_raise_to": self.min_raise_to,
             "max_raise_to": self.max_raise_to,

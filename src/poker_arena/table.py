@@ -187,12 +187,20 @@ class Table:
             self._award_without_showdown(state)
             return
 
-        if len(active_not_all_in_seats(state)) == 0:
+        active_actors = active_not_all_in_seats(state)
+        if len(active_actors) == 0:
             self._deal_remaining_board(state)
             self._showdown(state)
             return
 
         if betting_round_complete(state):
+            # Once every opponent is all-in, there is nobody left who can
+            # respond to another wager. Run out the board instead of asking
+            # the sole player with chips to check through empty betting rounds.
+            if len(active_actors) < 2:
+                self._deal_remaining_board(state)
+                self._showdown(state)
+                return
             self._advance_street_or_showdown(state)
             return
 
@@ -209,7 +217,7 @@ class Table:
             self._showdown(state)
             return
 
-        if len(active_not_all_in_seats(state)) == 0:
+        if len(active_not_all_in_seats(state)) < 2:
             self._deal_remaining_board(state)
             self._showdown(state)
         else:

@@ -278,7 +278,7 @@ class TensorPokerState:
 
         facing = legal.facing_bet
         action_types[:, 0] = FOLD
-        valid[:, 0] = ~self.terminal
+        valid[:, 0] = facing & ~self.terminal
         if width > 1:
             action_types[:, 1] = torch.where(facing, torch.full_like(legal.actor, CALL), torch.full_like(legal.actor, CHECK))
             valid[:, 1] = ~self.terminal
@@ -404,6 +404,9 @@ class TensorPokerState:
         remaining &= ~self.terminal
         matched = (self.committed == self.current_bet[:, None]) & self.acted
         round_complete = remaining & ((~active) | matched).all(dim=1)
+        uncontested_betting = round_complete & (active.sum(dim=1) < 2)
+        self._showdown(uncontested_betting)
+
         river_complete = round_complete & (self.street == 3)
         self._showdown(river_complete)
 

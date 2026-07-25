@@ -63,6 +63,26 @@ class BotTests(unittest.TestCase):
         self.assertIn(30, raise_totals)
         self.assertEqual(len(raise_totals), len(set(raise_totals)))
 
+    def test_torch_policy_bot_cannot_fold_when_check_is_free(self):
+        bot = TorchPolicyBot.__new__(TorchPolicyBot)
+        bot.integer_action_budget = 4
+        bot.required_integer_actions = ()
+        legal = LegalActions(
+            can_fold=False,
+            can_check=True,
+            can_call=False,
+            call_amount=0,
+            min_raise_to=20,
+            max_raise_to=100,
+            current_bet=0,
+            actor_commitment=0,
+        )
+
+        actions = bot._candidate_actions(legal)
+
+        self.assertNotIn("fold", {action.action_type.value for action in actions})
+        self.assertIn("check", {action.action_type.value for action in actions})
+
 
 if __name__ == "__main__":
     unittest.main()

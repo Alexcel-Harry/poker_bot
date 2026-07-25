@@ -18,6 +18,16 @@ class TableBettingTests(unittest.TestCase):
         self.assertEqual(state.big_blind_seat, 1)
         self.assertEqual(state.current_actor, 0)
 
+    def test_big_blind_cannot_fold_after_limp_when_check_is_free(self):
+        table = Table(TableConfig(seats=2, small_blind=5, big_blind=10, starting_stacks=[100, 100], seed=1))
+        table.start_hand()
+
+        state = table.apply(Action.call())
+        legal = state.legal_actions(state.current_actor)
+
+        self.assertTrue(legal.can_check)
+        self.assertFalse(legal.can_fold)
+
     def test_three_player_hand_allows_arbitrary_integer_raise_to(self):
         table = Table(TableConfig(seats=3, small_blind=5, big_blind=10, starting_stacks=[100, 100, 100], seed=1))
         state = table.start_hand()
@@ -28,6 +38,7 @@ class TableBettingTests(unittest.TestCase):
         self.assertEqual(legal.call_amount, 10)
         self.assertEqual(legal.min_raise_to, 20)
         self.assertEqual(legal.max_raise_to, 100)
+        self.assertTrue(legal.to_dict()["can_raise"])
 
         state = table.apply(Action.raise_to(23))
         self.assertEqual(state.committed_this_street[0], 23)
@@ -64,6 +75,38 @@ class TableBettingTests(unittest.TestCase):
         self.assertEqual(state.street, Street.SHOWDOWN)
         self.assertEqual(starting_total, ending_total)
         self.assertTrue(any(event.event_type == "pot_awarded" for event in state.events))
+
+    def test_turn_raise_and_call_leads_to_a_playable_river(self):
+        table = Table(TableConfig(seats=2, small_blind=5, big_blind=10, starting_stacks=[100, 100], seed=3))
+        table.start_hand()
+        table.apply(Action.call())
+        table.apply(Action.check())
+        table.apply(Action.check())
+        table.apply(Action.check())
+        table.apply(Action.raise_to(20))
+
+        state = table.apply(Action.call())
+
+        self.assertEqual(state.street, Street.RIVER)
+        self.assertEqual(len(state.board), 5)
+        self.assertFalse(state.is_terminal)
+        self.assertIsNotNone(state.current_actor)
+
+    def test_calling_a_shorter_all_in_runs_out_river_without_empty_betting_round(self):
+        table = Table(TableConfig(seats=2, small_blind=5, big_blind=10, starting_stacks=[150, 100], seed=3))
+        table.start_hand()
+        table.apply(Action.call())
+        table.apply(Action.check())
+        table.apply(Action.check())
+        table.apply(Action.check())
+        table.apply(Action.raise_to(90))
+
+        state = table.apply(Action.call())
+
+        self.assertTrue(state.is_terminal)
+        self.assertEqual(state.street, Street.SHOWDOWN)
+        self.assertEqual(len(state.board), 5)
+        self.assertTrue(any(event.event_type == "street_dealt" and event.data["street"] == "river" for event in state.events))
 
 
 class SidePotCarryoverTests(unittest.TestCase):

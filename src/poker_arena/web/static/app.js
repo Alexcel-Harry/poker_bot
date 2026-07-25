@@ -21,6 +21,13 @@ if (params.get("host_token")) {
   });
 }
 
+window.addEventListener("storage", (event) => {
+  if (event.key !== "pokerArenaHostToken") return;
+  state.hostToken = event.newValue || "";
+  const input = document.getElementById("hostTokenInput");
+  if (input) input.value = state.hostToken;
+});
+
 function connect() {
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const tokenQuery = state.seatToken ? `?seat_token=${encodeURIComponent(state.seatToken)}` : "";
@@ -48,6 +55,17 @@ function setConnection(text) {
   document.getElementById("connectionStatus").textContent = text;
 }
 
+function setActionMessage(text, isError = false) {
+  const message = document.getElementById("actionMessage");
+  message.textContent = text;
+  message.classList.toggle("error", isError);
+}
+
+function reportActionError(error) {
+  const text = error instanceof Error ? error.message : String(error);
+  setActionMessage(`Error: ${text}`, true);
+}
+
 function cardEl(text) {
   const card = document.createElement("span");
   card.className = `card ${/[hd]$/i.test(text) ? "red" : ""}`;
@@ -61,6 +79,7 @@ function render() {
   document.getElementById("roomTitle").textContent = `Room ${snap.room_code}`;
   document.getElementById("gameStatus").textContent = snap.paused_reason || snap.status;
   document.getElementById("blindStatus").textContent = `${snap.settings.small_blind} / ${snap.settings.big_blind}`;
+  document.getElementById("debugRevealStatus").textContent = snap.debug_reveal ? "debug cards: ON" : "debug cards: OFF";
   document.getElementById("roomCodeInput").value = snap.room_code;
 
   renderSeatOptions();
@@ -100,6 +119,9 @@ function renderSeats() {
     node.querySelector(".seat-number").textContent = `Seat ${seat.seat_id + 1}`;
     node.querySelector(".seat-name").textContent = seat.nickname || "Open";
     node.querySelector(".seat-stack").textContent = `${seat.stack} chips`;
+    const seatCards = node.querySelector(".seat-cards");
+    const revealedCards = state.snapshot.revealed_hole_cards && state.snapshot.revealed_hole_cards[seat.seat_id];
+    (revealedCards || []).forEach((text) => seatCards.appendChild(cardEl(text)));
     const badges = [];
     if (state.snapshot.button === seat.seat_id) badges.push("BTN");
     if (state.snapshot.small_blind === seat.seat_id) badges.push("SB");
@@ -131,21 +153,34 @@ function renderActions() {
   const call = document.getElementById("callButton");
   const raise = document.getElementById("raiseButton");
   const raiseByInput = document.getElementById("raiseByInput");
-  [fold, check, call, raise, raiseByInput, ...document.querySelectorAll("[data-raise]")].forEach((el) => {
+  const nextHand = document.getElementById("nextHandButton");
+  const quickRaises = [...document.querySelectorAll("[data-raise]")];
+  [fold, check, call, raise, raiseByInput, ...quickRaises].forEach((el) => {
     el.disabled = !legal;
   });
-  if (!legal) return;
+  nextHand.disabled = state.snapshot.status !== "finished" || !state.seatToken;
+  if (!legal) {
+    raiseByInput.value = "";
+    return;
+  }
 
   fold.disabled = !legal.can_fold;
   check.disabled = !legal.can_check;
   call.disabled = !legal.can_call;
   call.textContent = legal.can_call ? `Call ${legal.call_amount}` : "Call";
   raise.disabled = !legal.can_raise;
+  quickRaises.forEach((button) => {
+    button.disabled = !legal.can_raise;
+  });
   const minRaiseBy = legal.can_raise ? legal.min_raise_to - legal.current_bet : 1;
   const maxRaiseBy = legal.can_raise ? legal.max_raise_to - legal.current_bet : 1;
   raiseByInput.min = minRaiseBy;
   raiseByInput.max = maxRaiseBy;
   raiseByInput.placeholder = legal.can_raise ? `${minRaiseBy}-${maxRaiseBy}` : "";
+  const enteredRaiseBy = Number(raiseByInput.value);
+  if (legal.can_raise && (!Number.isFinite(enteredRaiseBy) || enteredRaiseBy < minRaiseBy || enteredRaiseBy > maxRaiseBy)) {
+    raiseByInput.value = minRaiseBy;
+  }
 }
 
 function renderLog() {
@@ -212,49 +247,88 @@ async function addBot() {
 
 async function submitAction(action) {
   if (!state.seatToken) return;
-  await postJSON("/api/action", {
+  const payload = await postJSON("/api/action", {
     seat_token: state.seatToken,
     action,
   });
+  const label = action.type === "raise_to" ? `Raise to ${action.total}` : action.type;
+  setActionMessage(`${label} accepted`);
+  return payload;
 }
 
-function setQuickRaise(kind) {
+async function startNextHand() {
+  if (!state.seatToken) return;
+  await postJSON("/api/next-hand", { seat_token: state.seatToken });
+}
+
+function quickRaiseTotal(kind) {
   const legal = state.snapshot && state.snapshot.legal_actions;
-  if (!legal || !legal.can_raise) return;
+  if (!legal || !legal.can_raise) return null;
   let value = legal.min_raise_to;
   if (kind === "half") value = legal.current_bet + Math.round(state.snapshot.pot / 2);
   if (kind === "pot") value = legal.current_bet + state.snapshot.pot;
   if (kind === "allin") value = legal.max_raise_to;
   value = Math.max(legal.min_raise_to, Math.min(legal.max_raise_to, value));
   document.getElementById("raiseByInput").value = Math.max(1, value - legal.current_bet);
+  return value;
+}
+
+async function submitQuickRaise(kind) {
+  const total = quickRaiseTotal(kind);
+  if (total === null) return;
+  await submitAction({ type: "raise_to", total });
+}
+
+async function submitCustomRaise() {
+  const input = document.getElementById("raiseByInput");
+  const total = raiseByToRaiseTo(Number(input.value));
+  if (total === null) throw new Error("Raising is not legal right now");
+  await submitAction({ type: "raise_to", total });
 }
 
 function raiseByToRaiseTo(raiseBy) {
   const legal = state.snapshot && state.snapshot.legal_actions;
   if (!legal || !legal.can_raise) return null;
+  if (!Number.isFinite(raiseBy) || raiseBy <= 0) {
+    throw new Error("Enter a positive raise amount");
+  }
   const total = legal.current_bet + Number(raiseBy);
   return Math.max(legal.min_raise_to, Math.min(legal.max_raise_to, total));
 }
 
-function downloadLog() {
+async function downloadLog() {
   const hostToken = document.getElementById("hostTokenInput").value.trim() || state.hostToken;
-  if (!hostToken) return;
-  window.location.href = `/api/logs/session.json?host_token=${encodeURIComponent(hostToken)}`;
+  const query = hostToken ? `?host_token=${encodeURIComponent(hostToken)}` : "";
+  const response = await fetch(`/api/logs/session.json${query}`);
+  if (!response.ok) {
+    const payload = await response.json();
+    throw new Error(payload.error || response.statusText);
+  }
+  const blob = await response.blob();
+  const downloadUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = downloadUrl;
+  link.download = "poker-arena-session.json";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(downloadUrl);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("joinButton").addEventListener("click", () => joinSeat().catch(alert));
   document.getElementById("addBotButton").addEventListener("click", () => addBot().catch(alert));
-  document.getElementById("downloadLogButton").addEventListener("click", downloadLog);
-  document.getElementById("foldButton").addEventListener("click", () => submitAction({ type: "fold", total: null }).catch(alert));
-  document.getElementById("checkButton").addEventListener("click", () => submitAction({ type: "check", total: null }).catch(alert));
-  document.getElementById("callButton").addEventListener("click", () => submitAction({ type: "call", total: null }).catch(alert));
-  document.getElementById("raiseButton").addEventListener("click", () => {
-    const total = raiseByToRaiseTo(Number(document.getElementById("raiseByInput").value));
-    submitAction({ type: "raise_to", total }).catch(alert);
+  document.getElementById("downloadLogButton").addEventListener("click", () => downloadLog().catch(alert));
+  document.getElementById("foldButton").addEventListener("click", () => submitAction({ type: "fold", total: null }).catch(reportActionError));
+  document.getElementById("checkButton").addEventListener("click", () => submitAction({ type: "check", total: null }).catch(reportActionError));
+  document.getElementById("callButton").addEventListener("click", () => submitAction({ type: "call", total: null }).catch(reportActionError));
+  document.getElementById("nextHandButton").addEventListener("click", () => startNextHand().catch(alert));
+  document.getElementById("raiseForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    submitCustomRaise().catch(reportActionError);
   });
   document.querySelectorAll("[data-raise]").forEach((button) => {
-    button.addEventListener("click", () => setQuickRaise(button.dataset.raise));
+    button.addEventListener("click", () => submitQuickRaise(button.dataset.raise).catch(reportActionError));
   });
   if (state.hostToken) document.getElementById("hostTokenInput").value = state.hostToken;
   connect();

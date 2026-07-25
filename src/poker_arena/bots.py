@@ -32,13 +32,17 @@ class RandomLegalBot:
         self._rng = random.Random(self.seed)
 
     def choose_action(self, view: PlayerHandView | None, legal_actions: LegalActions) -> Action:
-        actions = [Action.fold()]
+        actions: list[Action] = []
+        if legal_actions.can_fold:
+            actions.append(Action.fold())
         if legal_actions.can_check:
             actions.append(Action.check())
         if legal_actions.can_call:
             actions.append(Action.call())
         if legal_actions.can_raise and legal_actions.min_raise_to is not None and legal_actions.max_raise_to is not None:
             actions.append(Action.raise_to(self._rng.randint(legal_actions.min_raise_to, legal_actions.max_raise_to)))
+        if not actions:
+            return Action.fold()
         return self._rng.choice(actions)
 
 

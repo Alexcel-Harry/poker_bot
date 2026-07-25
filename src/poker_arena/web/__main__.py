@@ -37,6 +37,7 @@ def main() -> None:
     base_url = f"http://{public_host}:{args.port}"
     print(f"Poker Arena host URL: {base_url}/?host_token={room.host_token}")
     print(f"Guest URL: {base_url}/?room_code={room.room_code}")
+    print(f"Debug card reveal: {'ON' if room.reveal_all_hole_cards else 'OFF'}")
     print("LAN HTTP is for trusted local networks only.")
     uvicorn.run(app, host=host, port=args.port)
 

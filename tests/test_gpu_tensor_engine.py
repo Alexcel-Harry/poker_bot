@@ -6,6 +6,8 @@ import torch
 from poker_arena import Action, Table
 from poker_arena.cards import full_deck
 from poker_arena.cfr.gpu_prefix_branch import (
+    CALL,
+    FOLD,
     GpuPrefixBranchTrainingConfig,
     TensorPokerState,
     evaluate_seven_card_hands,
@@ -49,6 +51,15 @@ class TensorPokerEngineTests(unittest.TestCase):
 
         self.assertTrue(torch.equal(state.stacks, before))
         self.assertEqual(branches.batch_size, 32)
+
+    def test_tensor_candidates_do_not_offer_fold_when_check_is_free(self):
+        state = TensorPokerState.new_batch(TableConfig(2, 5, 10, [100, 100]), 1, self.device, self.generator)
+        state.apply_actions(torch.tensor([CALL]), torch.tensor([0]))
+
+        action_types, _totals, valid, legal = state.candidate_actions(8, self.generator)
+
+        self.assertFalse(bool(legal.facing_bet[0]))
+        self.assertFalse(bool(((action_types == FOLD) & valid).any()))
 
     def test_tensor_model_features_match_the_deployed_python_encoders(self):
         batch = TensorPokerState.new_batch(self.table_config, 16, self.device, self.generator)
@@ -118,9 +129,6 @@ class TensorPokerEngineTests(unittest.TestCase):
             Action.raise_to(100),
             Action.raise_to(200),
             Action.call(),
-            Action.check(),
-            Action.check(),
-            Action.check(),
         ]
         action_ids = {"fold": 0, "check": 1, "call": 2, "raise_to": 3}
 

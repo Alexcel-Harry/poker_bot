@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Poker Arena</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260724-session-recovery-2" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260725-host-session-1" />
   </head>
   <body>
     <main class="shell">
@@ -17,6 +17,7 @@
           <span id="connectionStatus">offline</span>
           <span id="gameStatus">waiting</span>
           <span id="blindStatus">10 / 20</span>
+          <span id="debugRevealStatus">debug cards</span>
         </div>
       </section>
 
@@ -43,7 +44,7 @@
             <h2>Host</h2>
             <label>
               Host token
-              <input id="hostTokenInput" autocomplete="off" />
+              <input id="hostTokenInput" autocomplete="off" placeholder="Automatic on this PC; required over LAN" />
             </label>
             <label>
               Bot seat
@@ -76,17 +77,19 @@
               <button id="foldButton">Fold</button>
               <button id="checkButton">Check</button>
               <button id="callButton">Call</button>
+              <button id="nextHandButton">Next Hand</button>
             </div>
-            <div class="raise-box">
+            <form id="raiseForm" class="raise-box">
               <input id="raiseByInput" type="number" min="1" step="1" inputmode="numeric" aria-label="Raise by amount" />
-              <button id="raiseButton" class="primary">Raise By</button>
+              <button id="raiseButton" type="submit" class="primary">Raise By</button>
               <div class="quick-raises">
-                <button data-raise="min">Min</button>
-                <button data-raise="half">Half Pot</button>
-                <button data-raise="pot">Pot</button>
-                <button data-raise="allin">All In</button>
+                <button type="button" data-raise="min">Min</button>
+                <button type="button" data-raise="half">Half Pot</button>
+                <button type="button" data-raise="pot">Pot</button>
+                <button type="button" data-raise="allin">All In</button>
               </div>
-            </div>
+              <div id="actionMessage" class="action-message" aria-live="polite"></div>
+            </form>
           </div>
         </section>
       </section>
@@ -97,10 +100,11 @@
         <span class="seat-number"></span>
         <span class="seat-name"></span>
         <span class="seat-stack"></span>
+        <span class="seat-cards" aria-label="Revealed hole cards"></span>
         <span class="seat-badges"></span>
       </button>
     </template>
 
-    <script src="/static/app.js?v=20260724-session-recovery-2"></script>
+    <script src="/static/app.js?v=20260725-debug-cards-1"></script>
   </body>
 </html>

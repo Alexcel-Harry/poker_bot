@@ -1,6 +1,7 @@
 import unittest
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from poker_arena import Action, CheckCallBot
@@ -22,6 +23,17 @@ class FakeWebSocket:
 
     async def close(self, code: int, reason: str) -> None:
         self.closed = (code, reason)
+
+
+class FakeRequest:
+    def __init__(self, *, client_host=None, cookies=None, query_params=None, payload=None) -> None:
+        self.client = SimpleNamespace(host=client_host) if client_host is not None else None
+        self.cookies = cookies or {}
+        self.query_params = query_params or {}
+        self.payload = payload or {}
+
+    async def json(self) -> dict[str, object]:
+        return self.payload
 
 
 class PokerRoomSecurityTests(unittest.TestCase):
@@ -123,6 +135,16 @@ class PokerRoomPlayTests(unittest.TestCase):
             )
         )
 
+    def test_human_snapshot_explicitly_reports_raise_availability(self):
+        room = PokerRoom(seed=7)
+        ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+        room.join(room_code=room.room_code, seat_id=1, nickname="Grace")
+
+        legal = room.snapshot_for(seat_token=ada["seat_token"])["legal_actions"]
+
+        self.assertTrue(legal["can_raise"])
+        self.assertEqual(legal["min_raise_to"], 40)
+
     def test_policy_backed_bot_auto_advances_when_human_join_starts_hand(self):
         room = PokerRoom(seed=7, bot_policy_factory=lambda _seat_id: CheckCallBot())
         room.reserve_bot(host_token=room.host_token, seat_id=0)
@@ -152,9 +174,47 @@ class PokerRoomPlayTests(unittest.TestCase):
         self.assertEqual(log["room_code"], room.room_code)
         self.assertTrue(log["hands"])
         self.assertNotIn("snapshot", str(log))
-        self.assertNotIn("hole_cards", str(log))
+        self.assertEqual(len(log["hands"][0]["hole_cards"]), 2)
+        self.assertTrue(all(len(player["cards"]) == 2 for player in log["hands"][0]["hole_cards"]))
         with self.assertRaises(PermissionError):
             room.session_log(host_token="bad-token")
+
+    def test_debug_reveal_exposes_all_hole_cards_in_snapshot(self):
+        room = PokerRoom(seed=7, reveal_all_hole_cards=True)
+        ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+        room.join(room_code=room.room_code, seat_id=1, nickname="Grace")
+
+        snapshot = room.snapshot_for(seat_token=ada["seat_token"])
+
+        self.assertTrue(snapshot["debug_reveal"])
+        self.assertEqual(set(snapshot["revealed_hole_cards"]), {0, 1})
+        self.assertTrue(all(len(cards) == 2 for cards in snapshot["revealed_hole_cards"].values()))
+
+    def test_finished_hand_remains_visible_until_human_starts_next_hand(self):
+        room = PokerRoom(seed=7, bot_policy_factory=lambda _seat_id: CheckCallBot())
+        ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+        room.reserve_bot(host_token=room.host_token, seat_id=1)
+
+        while room.table is not None and room.table.current_hand is not None and not room.table.current_hand.is_terminal:
+            state = room.table.current_hand
+            if room.engine_to_display[state.current_actor] == 0:
+                legal = state.legal_actions(state.current_actor)
+                action = Action.check() if legal.can_check else Action.call()
+                room.submit_action(seat_token=ada["seat_token"], action=action)
+            else:
+                room.advance_bots()
+
+        finished = room.snapshot_for(seat_token=ada["seat_token"])
+        self.assertEqual(finished["status"], "finished")
+        self.assertEqual(finished["street"], "showdown")
+        self.assertEqual(len(finished["board"]), 5)
+        self.assertEqual(len(room.completed_hands), 1)
+
+        room.start_next_hand(seat_token=ada["seat_token"])
+        next_snapshot = room.snapshot_for(seat_token=ada["seat_token"])
+        self.assertNotEqual(next_snapshot["status"], "finished")
+        next_hand_started = next(event for event in next_snapshot["log"] if event["event_type"] == "hand_started")
+        self.assertEqual(next_hand_started["data"]["hand_number"], 2)
 
 
 class StaticAppTests(unittest.TestCase):
@@ -185,18 +245,100 @@ class StaticAppTests(unittest.TestCase):
         self.assertIn("seat-grid", index)
         self.assertIn("raiseByInput", index)
         self.assertIn("Raise By", index)
+        self.assertIn("nextHandButton", index)
+        self.assertIn("raiseForm", index)
+        self.assertIn("seat-cards", index)
         self.assertIn("downloadLog", app_js)
+        self.assertIn("Automatic on this PC; required over LAN", index)
         self.assertIn("raise_by", app_js)
         self.assertIn("raiseByToRaiseTo", app_js)
         self.assertIn("localStorage", app_js)
         self.assertIn('localStorage.removeItem("pokerArenaSeatToken")', app_js)
         self.assertIn("INVALID_SEAT_TOKEN_CLOSE_CODE", app_js)
+        self.assertIn('event.key !== "pokerArenaHostToken"', app_js)
         self.assertIn('document.getElementById("roomCodeInput").value = snap.room_code', app_js)
         self.assertNotIn('document.getElementById("roomCodeInput").value ||= snap.room_code', app_js)
         self.assertNotIn('.seat[data-seat="8"] { left: calc(50% - 67px); top: 42%; }', styles)
         self.assertIn('.seat[data-seat="8"] { left: 18%; top: 72px; }', styles)
-        self.assertIn("styles.css?v=20260724-session-recovery-2", index)
-        self.assertIn("app.js?v=20260724-session-recovery-2", index)
+        self.assertIn("styles.css?v=20260725-host-session-1", index)
+        self.assertIn("submitQuickRaise", app_js)
+        self.assertIn("submitCustomRaise", app_js)
+        self.assertIn("debug cards: ON", app_js)
+        self.assertNotIn("if (!hostToken) return", app_js)
+        self.assertIn("app.js?v=20260725-debug-cards-1", index)
+
+
+class HostSessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_loopback_request_can_reserve_bot_without_host_token(self):
+        web_app = importlib.import_module("poker_arena.web.app")
+        fresh_room = PokerRoom(seed=23)
+        request = FakeRequest(client_host="127.0.0.1", payload={"host_token": "", "seat_id": 2})
+
+        with patch.object(web_app, "room", fresh_room):
+            response = await web_app.host_bots(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fresh_room.seats[2].kind, "bot")
+
+    async def test_remote_request_without_host_token_is_forbidden(self):
+        web_app = importlib.import_module("poker_arena.web.app")
+        fresh_room = PokerRoom(seed=23)
+        request = FakeRequest(client_host="192.0.2.10", payload={"host_token": "", "seat_id": 2})
+
+        with patch.object(web_app, "room", fresh_room):
+            response = await web_app.host_bots(request)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(fresh_room.seats[2].kind, "empty")
+
+    async def test_current_host_cookie_overrides_stale_form_token(self):
+        web_app = importlib.import_module("poker_arena.web.app")
+        fresh_room = PokerRoom(seed=23)
+        request = FakeRequest(
+            cookies={web_app.HOST_SESSION_COOKIE: fresh_room.host_token},
+            payload={"host_token": "expired-token-from-old-tab", "seat_id": 2},
+        )
+
+        with patch.object(web_app, "room", fresh_room):
+            response = await web_app.host_bots(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fresh_room.seats[2].kind, "bot")
+        self.assertIn(web_app.HOST_SESSION_COOKIE, response.headers["set-cookie"])
+
+    async def test_expired_form_token_without_current_host_cookie_is_forbidden(self):
+        web_app = importlib.import_module("poker_arena.web.app")
+        fresh_room = PokerRoom(seed=23)
+        request = FakeRequest(payload={"host_token": "expired-token-from-old-tab", "seat_id": 2})
+
+        with patch.object(web_app, "room", fresh_room):
+            response = await web_app.host_bots(request)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(fresh_room.seats[2].kind, "empty")
+
+    async def test_current_host_url_sets_session_cookie(self):
+        web_app = importlib.import_module("poker_arena.web.app")
+        fresh_room = PokerRoom(seed=23)
+        request = FakeRequest(query_params={"host_token": fresh_room.host_token})
+
+        with patch.object(web_app, "room", fresh_room):
+            response = await web_app.index(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(web_app.HOST_SESSION_COOKIE, response.headers["set-cookie"])
+        self.assertIn("HttpOnly", response.headers["set-cookie"])
+
+    async def test_bare_loopback_root_sets_session_cookie(self):
+        web_app = importlib.import_module("poker_arena.web.app")
+        fresh_room = PokerRoom(seed=23)
+        request = FakeRequest(client_host="::1")
+
+        with patch.object(web_app, "room", fresh_room):
+            response = await web_app.index(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(web_app.HOST_SESSION_COOKIE, response.headers["set-cookie"])
 
 
 class WebSocketSessionRecoveryTests(unittest.IsolatedAsyncioTestCase):

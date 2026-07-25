@@ -47,11 +47,17 @@ class RoomSeat:
 
 
 class PokerRoom:
-    def __init__(self, seed: int | None = None, bot_policy_factory: Callable[[int], BotPolicy | None] | None = None) -> None:
+    def __init__(
+        self,
+        seed: int | None = None,
+        bot_policy_factory: Callable[[int], BotPolicy | None] | None = None,
+        reveal_all_hole_cards: bool = False,
+    ) -> None:
         self.room_code = _room_code()
         self.host_token = secrets.token_urlsafe(24)
         self.seed = seed
         self.bot_policy_factory = bot_policy_factory
+        self.reveal_all_hole_cards = reveal_all_hole_cards
         self.seats = [RoomSeat(seat_id=seat_id) for seat_id in range(MAX_SEATS)]
         self.table: Table | None = None
         self.display_to_engine: dict[int, int] = {}
@@ -59,6 +65,8 @@ class PokerRoom:
         self.completed_hands: list[dict[str, Any]] = []
         self._hand_seed_counter = 0
         self._last_button_display: int | None = None
+        self._terminal_hand_recorded = False
+        self._hand_number = 0
 
     def join(self, room_code: str, seat_id: int, nickname: str) -> dict[str, Any]:
         if room_code != self.room_code:
@@ -114,6 +122,19 @@ class PokerRoom:
         self.advance_bots()
         return self.snapshot_for(seat_token=seat_token)
 
+    def start_next_hand(self, seat_token: str) -> dict[str, Any]:
+        self._seat_for_token(seat_token)
+        if self.table is None or self.table.current_hand is None or not self.table.current_hand.is_terminal:
+            raise ValueError("The current hand is not finished")
+
+        self.table = None
+        self.display_to_engine = {}
+        self.engine_to_display = {}
+        self._terminal_hand_recorded = False
+        self._ensure_hand_started()
+        self.advance_bots()
+        return self.snapshot_for(seat_token=seat_token)
+
     def advance_bots(self, max_actions: int = 100) -> None:
         actions_taken = 0
         while True:
@@ -124,7 +145,7 @@ class PokerRoom:
             state = self.table.current_hand
             if state.is_terminal:
                 self._complete_terminal_hand(state)
-                continue
+                return
             if state.current_actor is None:
                 return
             display_seat = self.engine_to_display[state.current_actor]
@@ -151,6 +172,7 @@ class PokerRoom:
         current_bet = 0
         legal_actions: dict[str, Any] | None = None
         private_cards: list[str] | None = None
+        revealed_hole_cards: dict[int, list[str]] = {}
         log_events: list[dict[str, Any]] = []
 
         if self.table is not None and self.table.current_hand is not None:
@@ -161,6 +183,11 @@ class PokerRoom:
             pot = public_view.pot
             current_bet = hand.current_bet
             log_events = [event.to_dict() for event in public_view.events][-40:]
+            if self.reveal_all_hole_cards:
+                for engine_seat, display_seat in self.engine_to_display.items():
+                    revealed_hole_cards[display_seat] = [
+                        card.to_str() for card in hand.player_by_seat(engine_seat).hole_cards
+                    ]
             if viewer_display in self.display_to_engine:
                 engine_seat = self.display_to_engine[viewer_display]
                 cards = hand.player_view(engine_seat).hole_cards[engine_seat]
@@ -184,13 +211,19 @@ class PokerRoom:
             "current_bet": current_bet,
             "legal_actions": legal_actions,
             "private_hole_cards": private_cards,
+            "revealed_hole_cards": revealed_hole_cards,
+            "debug_reveal": self.reveal_all_hole_cards,
             "log": log_events,
         }
 
     def session_log(self, host_token: str) -> dict[str, Any]:
         self._require_host(host_token)
         hands = list(self.completed_hands)
-        if self.table is not None and self.table.current_hand is not None:
+        if (
+            self.table is not None
+            and self.table.current_hand is not None
+            and not (self.table.current_hand.is_terminal and self._terminal_hand_recorded)
+        ):
             hands.append(self._hand_record(self.table.current_hand))
         return {
             "room_code": self.room_code,
@@ -218,10 +251,13 @@ class PokerRoom:
             seed=seed,
         )
         table = Table(config)
+        table.hand_number = self._hand_number
         if self._last_button_display in self.display_to_engine:
             table.button = self.display_to_engine[self._last_button_display]
         table.start_hand()
+        self._hand_number = table.hand_number
         self.table = table
+        self._terminal_hand_recorded = False
         if table.current_hand is not None:
             self._last_button_display = self.engine_to_display[table.current_hand.button]
             self._sync_display_stacks()
@@ -229,11 +265,9 @@ class PokerRoom:
     def _complete_terminal_hand(self, state: Any) -> bool:
         if not state.is_terminal:
             return False
-        self.completed_hands.append(self._hand_record(state))
-        self.table = None
-        self.display_to_engine = {}
-        self.engine_to_display = {}
-        self._ensure_hand_started()
+        if not self._terminal_hand_recorded:
+            self.completed_hands.append(self._hand_record(state))
+            self._terminal_hand_recorded = True
         return True
 
     def _sync_display_stacks(self) -> None:
@@ -243,8 +277,22 @@ class PokerRoom:
             self.seats[display_seat].stack = self.table.current_hand.player_by_seat(engine_seat).stack
 
     def _hand_record(self, state: Any) -> dict[str, Any]:
+        hole_cards = []
+        for player in state.players:
+            display_seat = self.engine_to_display.get(player.seat_id, player.seat_id)
+            seat = self.seats[display_seat]
+            hole_cards.append(
+                {
+                    "seat_id": display_seat,
+                    "nickname": seat.nickname,
+                    "kind": seat.kind,
+                    "cards": [card.to_str() for card in player.hole_cards],
+                }
+            )
         return {
             "button": self.engine_to_display.get(state.button),
+            "board": [card.to_str() for card in state.board],
+            "hole_cards": hole_cards,
             "events": [event.to_dict() for event in state.events if event.event_type != "snapshot"],
         }
 
@@ -282,6 +330,8 @@ class PokerRoom:
         return self.engine_to_display[engine_seat]
 
     def _status(self, current_actor: int | None) -> dict[str, str | None]:
+        if self.table is not None and self.table.current_hand is not None and self.table.current_hand.is_terminal:
+            return {"status": "finished", "paused_reason": "Hand complete - review the river and result"}
         occupied = [seat for seat in self.seats if seat.occupied and seat.stack > 0]
         if len(occupied) < 2:
             return {"status": "waiting", "paused_reason": None}

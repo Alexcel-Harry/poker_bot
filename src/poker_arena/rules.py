@@ -32,7 +32,9 @@ def legal_actions_for(state: HandState, seat_id: int) -> LegalActions:
         max_total = max_raise_to
 
     return LegalActions(
-        can_fold=True,
+        # Folding while no bet is outstanding is a dominated no-op and made
+        # learned policies surrender the big blind instead of checking.
+        can_fold=call_amount > 0,
         can_check=call_amount == 0,
         can_call=call_amount > 0 and player.stack > 0,
         call_amount=min(call_amount, player.stack),

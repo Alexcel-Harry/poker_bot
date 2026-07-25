@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hmac
+import ipaddress
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -18,12 +21,23 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised when dependen
     ) from exc
 
 
-room = PokerRoom(bot_policy_factory=bot_policy_factory_from_env())
+REVEAL_ALL_HOLE_CARDS = os.environ.get("POKER_ARENA_REVEAL_CARDS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+room = PokerRoom(
+    bot_policy_factory=bot_policy_factory_from_env(),
+    reveal_all_hole_cards=REVEAL_ALL_HOLE_CARDS,
+)
 app = FastAPI(title="Poker Arena")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 INVALID_SEAT_TOKEN_CLOSE_CODE = 4401
+HOST_SESSION_COOKIE = "poker_arena_host_session"
+HOST_SESSION_MAX_AGE_SECONDS = 12 * 60 * 60
 
 
 class ConnectionManager:
@@ -66,9 +80,55 @@ def _error_response(exc: Exception) -> JSONResponse:
     return JSONResponse({"error": str(exc)}, status_code=status)
 
 
+def _is_loopback_request(request: Request) -> bool:
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", "") if client is not None else ""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _host_token_for_request(request: Request, supplied_token: str = "") -> str:
+    """Prefer any credential that matches the current server session.
+
+    A browser tab can retain an expired token after the server restarts.  The
+    cookie is refreshed by the newly printed host URL and is shared by tabs on
+    the same origin, so a stale form field cannot mask a valid host session.
+    """
+
+    if _is_loopback_request(request):
+        return room.host_token
+
+    cookie_token = request.cookies.get(HOST_SESSION_COOKIE, "")
+    for candidate in (cookie_token, supplied_token):
+        if candidate and hmac.compare_digest(candidate, room.host_token):
+            return candidate
+    return supplied_token or cookie_token
+
+
+def _set_host_session_cookie(response: JSONResponse | HTMLResponse) -> None:
+    response.set_cookie(
+        key=HOST_SESSION_COOKIE,
+        value=room.host_token,
+        max_age=HOST_SESSION_MAX_AGE_SECONDS,
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
-async def index() -> str:
-    return (STATIC_DIR / "index.html").read_text()
+async def index(request: Request) -> HTMLResponse:
+    response = HTMLResponse((STATIC_DIR / "index.html").read_text())
+    supplied_token = request.query_params.get("host_token", "")
+    if _is_loopback_request(request) or (
+        supplied_token and hmac.compare_digest(supplied_token, room.host_token)
+    ):
+        _set_host_session_cookie(response)
+    elif supplied_token:
+        response.delete_cookie(HOST_SESSION_COOKIE, path="/")
+    return response
 
 
 @app.post("/api/join")
@@ -98,27 +158,43 @@ async def action(request: Request) -> JSONResponse:
     return JSONResponse(result)
 
 
-@app.post("/api/host/bots")
-async def host_bots(request: Request) -> JSONResponse:
+@app.post("/api/next-hand")
+async def next_hand(request: Request) -> JSONResponse:
     data = await request.json()
     try:
-        result = room.reserve_bot(host_token=str(data.get("host_token", "")), seat_id=int(data.get("seat_id")))
+        result = room.start_next_hand(seat_token=str(data.get("seat_token", "")))
     except Exception as exc:
         return _error_response(exc)
     await manager.broadcast()
     return JSONResponse(result)
 
 
-@app.get("/api/logs/session.json")
-async def session_json(host_token: str) -> JSONResponse:
+@app.post("/api/host/bots")
+async def host_bots(request: Request) -> JSONResponse:
+    data = await request.json()
     try:
-        payload = room.session_log(host_token=host_token)
+        host_token = _host_token_for_request(request, str(data.get("host_token", "")))
+        result = room.reserve_bot(host_token=host_token, seat_id=int(data.get("seat_id")))
     except Exception as exc:
         return _error_response(exc)
-    return JSONResponse(
+    await manager.broadcast()
+    response = JSONResponse(result)
+    _set_host_session_cookie(response)
+    return response
+
+
+@app.get("/api/logs/session.json")
+async def session_json(request: Request, host_token: str = "") -> JSONResponse:
+    try:
+        payload = room.session_log(host_token=_host_token_for_request(request, host_token))
+    except Exception as exc:
+        return _error_response(exc)
+    response = JSONResponse(
         payload,
         headers={"Content-Disposition": "attachment; filename=poker-arena-session.json"},
     )
+    _set_host_session_cookie(response)
+    return response
 
 
 @app.websocket("/ws")
