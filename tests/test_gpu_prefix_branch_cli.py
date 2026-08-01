@@ -10,6 +10,7 @@ from examples.train_gpu_prefix_branch import (
     _require_single_cuda_gpu,
     build_parser,
     parse_hidden,
+    parse_fractions,
 )
 
 
@@ -21,7 +22,8 @@ class GpuPrefixBranchCliTests(unittest.TestCase):
         self.assertEqual(args.gpus, "0")
         self.assertEqual(args.iterations, 10_000)
         self.assertEqual(args.parallel_hands, 1024)
-        self.assertEqual(args.branch_width, 32)
+        self.assertEqual(args.branch_width, 8)
+        self.assertEqual(args.chance_replicas, 4)
 
     def test_cpu_and_no_gpu_are_rejected_by_the_parser_or_validator(self):
         parser = build_parser()
@@ -50,6 +52,11 @@ class GpuPrefixBranchCliTests(unittest.TestCase):
         self.assertEqual(parse_hidden("64, 32"), (64, 32))
         with self.assertRaises(ValueError):
             parse_hidden("64,0")
+
+    def test_pot_fraction_parser_validates_values(self):
+        self.assertEqual(parse_fractions("0.33, 0.75,1.5"), (0.33, 0.75, 1.5))
+        with self.assertRaises(ValueError):
+            parse_fractions("0.5,0")
 
     def test_script_help_does_not_initialize_cuda_or_start_training(self):
         environment = dict(os.environ)

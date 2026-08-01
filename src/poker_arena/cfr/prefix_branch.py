@@ -59,15 +59,24 @@ class EmbeddingCoverageIndex:
 class ActionEmbedding:
     """Continuous features for concrete actions, including arbitrary integer raises."""
 
-    dimension_without_trajectory = 12
+    legacy_dimension = 12
+    dimension_without_trajectory = 14
+
+    def __init__(self, include_pot_features: bool = True) -> None:
+        self.include_pot_features = include_pot_features
+
+    @property
+    def feature_dimension(self) -> int:
+        return self.dimension_without_trajectory if self.include_pot_features else self.legacy_dimension
 
     def encode(
         self,
         action: Action,
         legal_context: LegalActions,
         trajectory_embedding: Sequence[float] | None = None,
+        pot: int | None = None,
     ) -> list[float]:
-        vector = [0.0] * self.dimension_without_trajectory
+        vector = [0.0] * self.feature_dimension
         action_index = {
             ActionType.FOLD: 0,
             ActionType.CHECK: 1,
@@ -92,6 +101,9 @@ class ActionEmbedding:
         vector[9] = legal_context.actor_commitment / actor_stack_before
         vector[10] = min_raise / actor_stack_before
         vector[11] = max_raise / actor_stack_before
+        if self.include_pot_features and pot is not None and action.action_type == ActionType.RAISE_TO:
+            vector[12] = added / max(1.0, float(pot))
+            vector[13] = total / max(1.0, float(pot + legal_context.call_amount))
         if trajectory_embedding is not None:
             vector.extend(float(value) for value in trajectory_embedding)
         return vector
@@ -135,6 +147,7 @@ class IntegerActionSampler:
         if legal.can_raise and legal.min_raise_to is not None and legal.max_raise_to is not None:
             raise_totals = self._sample_raise_totals(
                 legal,
+                pot=state.total_pot,
                 budget=max(0, budget - len(actions)),
                 required_amounts=required_amounts,
                 coverage_index=coverage_index,
@@ -146,6 +159,7 @@ class IntegerActionSampler:
     def _sample_raise_totals(
         self,
         legal: LegalActions,
+        pot: int,
         budget: int,
         required_amounts: Sequence[int],
         coverage_index: EmbeddingCoverageIndex | None,
@@ -172,7 +186,12 @@ class IntegerActionSampler:
                 pool = sorted(
                     pool,
                     key=lambda total: coverage_index.novelty(
-                        self.action_embedding.encode(Action.raise_to(total), legal, trajectory_embedding)
+                        self.action_embedding.encode(
+                            Action.raise_to(total),
+                            legal,
+                            trajectory_embedding,
+                            pot=pot,
+                        )
                     ),
                     reverse=True,
                 )
@@ -243,7 +262,12 @@ class PrefixBranchExplorer:
             return BranchResult(action, [0.0] * table.config.seats, True, 0, [], [])
         legal = before.legal_actions(actor)
         trajectory_before = self.trajectory_encoder.encode_events(before.events)
-        action_vector = self.action_embedding.encode(action, legal, trajectory_before)
+        action_vector = self.action_embedding.encode(
+            action,
+            legal,
+            trajectory_before,
+            pot=before.total_pot,
+        )
         steps = 0
         try:
             branch.apply(action)
@@ -479,7 +503,11 @@ class PrefixBranchCFRTrainer:
                 torch_sample = TorchTrainingSample(
                     state_features=state_features,
                     trajectory_features=trajectory,
-                    action_features=self.action_embedding.encode(branch.action, legal),
+                    action_features=self.action_embedding.encode(
+                        branch.action,
+                        legal,
+                        pot=state.total_pot,
+                    ),
                     action=branch.action.to_dict(),
                     target_utility=utility / utility_scale,
                     weight=1.0,

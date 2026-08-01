@@ -83,10 +83,21 @@ function render() {
   document.getElementById("roomCodeInput").value = snap.room_code;
 
   renderSeatOptions();
+  renderHostControls();
   renderSeats();
   renderBoard();
   renderActions();
   renderLog();
+}
+
+function renderHostControls() {
+  const startGame = document.getElementById("startGameButton");
+  startGame.disabled = !state.snapshot.can_start_game;
+  startGame.title = state.snapshot.game_started
+    ? "The game has already started"
+    : state.snapshot.can_start_game
+      ? "Start the first hand with the occupied seats"
+      : "Reserve or claim at least two seats before starting";
 }
 
 function renderSeatOptions() {
@@ -254,6 +265,15 @@ async function addBot() {
   });
 }
 
+async function startGame() {
+  state.hostToken = document.getElementById("hostTokenInput").value.trim();
+  localStorage.setItem("pokerArenaHostToken", state.hostToken);
+  await postJSON("/api/host/start-game", {
+    host_token: state.hostToken,
+  });
+  setActionMessage("Game started");
+}
+
 async function submitAction(action) {
   if (!state.seatToken) return;
   const payload = await postJSON("/api/action", {
@@ -327,6 +347,7 @@ async function downloadLog() {
 document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("joinButton").addEventListener("click", () => joinSeat().catch(alert));
   document.getElementById("addBotButton").addEventListener("click", () => addBot().catch(alert));
+  document.getElementById("startGameButton").addEventListener("click", () => startGame().catch(alert));
   document.getElementById("downloadLogButton").addEventListener("click", () => downloadLog().catch(alert));
   document.getElementById("foldButton").addEventListener("click", () => submitAction({ type: "fold", total: null }).catch(reportActionError));
   document.getElementById("checkButton").addEventListener("click", () => submitAction({ type: "check", total: null }).catch(reportActionError));

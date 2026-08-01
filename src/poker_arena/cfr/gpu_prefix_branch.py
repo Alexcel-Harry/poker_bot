@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from itertools import combinations
 import math
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import torch
@@ -17,13 +18,18 @@ CHECK = 1
 CALL = 2
 RAISE_TO = 3
 INVALID_ACTION = -1
+ACTION_NAMES = ("fold", "check", "call", "raise_to")
+STREET_NAMES = ("preflop", "flop", "turn", "river")
+GPU_TRAINING_SNAPSHOT_VERSION = 1
 
 
 @dataclass(frozen=True)
 class GpuPrefixBranchTrainingConfig:
     """Configuration for the fully tensorized CUDA training pipeline."""
 
-    branch_width: int = 32
+    branch_width: int = 8
+    chance_replicas: int = 4
+    pot_fractions: tuple[float, ...] = (1.0 / 3.0, 0.75, 1.5)
     parallel_hands: int = 1024
     max_decisions_per_hand: int = 64
     max_rollout_actions: int = 128
@@ -42,6 +48,7 @@ class GpuPrefixBranchTrainingConfig:
     def __post_init__(self) -> None:
         positive = (
             "branch_width",
+            "chance_replicas",
             "parallel_hands",
             "max_decisions_per_hand",
             "max_rollout_actions",
@@ -55,6 +62,8 @@ class GpuPrefixBranchTrainingConfig:
                 raise ValueError(f"{name} must be positive")
         if self.branch_width < 3:
             raise ValueError("branch_width must be at least 3 so fold/check, call, and raise can be represented")
+        if any(fraction <= 0 for fraction in self.pot_fractions):
+            raise ValueError("pot_fractions must contain positive values")
         if self.optimizer_steps_per_decision < 0:
             raise ValueError("optimizer_steps_per_decision must be non-negative")
         if self.final_epochs < 0:
@@ -235,6 +244,26 @@ class TensorPokerState:
         indices = torch.arange(self.batch_size, device=self.device).repeat_interleave(repeats)
         return self.index_select(indices)
 
+    def repeat_chance_actions(
+        self,
+        chance_replicas: int,
+        action_width: int,
+        generator: torch.Generator,
+    ) -> TensorPokerState:
+        """Create independent future decks, shared by every sibling action."""
+
+        if chance_replicas <= 0 or action_width <= 0:
+            raise ValueError("chance_replicas and action_width must be positive")
+        replicas = self.repeat_interleave(chance_replicas)
+        positions = torch.arange(52, device=self.device)[None, :]
+        already_dealt = positions < replicas.next_card[:, None]
+        random_keys = torch.rand(replicas.deck.shape, device=self.device, generator=generator)
+        # Negative position keys preserve the exact dealt prefix in its original order.
+        shuffle_keys = torch.where(already_dealt, positions.float() - 52.0, random_keys)
+        permutation = shuffle_keys.argsort(dim=1)
+        replicas.deck = replicas.deck.gather(1, permutation)
+        return replicas.repeat_interleave(action_width)
+
     def pot(self) -> torch.Tensor:
         return self.total_committed.sum(dim=1)
 
@@ -269,6 +298,7 @@ class TensorPokerState:
         width: int,
         generator: torch.Generator,
         required_amounts: Sequence[int] = (),
+        pot_fractions: Sequence[float] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, TensorLegalActions]:
         legal = self.legal_actions()
         batch = self.batch_size
@@ -284,6 +314,35 @@ class TensorPokerState:
             valid[:, 1] = ~self.terminal
 
         start = torch.full_like(legal.actor, 2)
+        if pot_fractions is not None:
+            pot_after_call = self.pot() + legal.call_amount
+            proposed_totals: list[torch.Tensor] = [legal.min_raise_to]
+            proposed_totals.extend(
+                self.current_bet + torch.round(pot_after_call.float() * float(fraction)).to(torch.int64)
+                for fraction in pot_fractions
+            )
+            proposed_totals.extend(torch.full_like(legal.actor, int(amount)) for amount in required_amounts)
+            proposed_totals.append(legal.max_raise_to)
+            for offset, proposed in enumerate(proposed_totals):
+                column = offset + 2
+                if column >= width:
+                    break
+                proposed = proposed.clamp(min=legal.min_raise_to, max=legal.max_raise_to)
+                is_raise_slot = legal.can_raise & ~self.terminal
+                action_types[:, column] = torch.where(
+                    is_raise_slot,
+                    torch.full_like(legal.actor, RAISE_TO),
+                    action_types[:, column],
+                )
+                totals[:, column] = torch.where(is_raise_slot, proposed, totals[:, column])
+                valid[:, column] |= is_raise_slot
+            raise_mask = valid & (action_types == RAISE_TO)
+            same_total = totals[:, :, None] == totals[:, None, :]
+            earlier = torch.tril(torch.ones((width, width), dtype=torch.bool, device=self.device), diagonal=-1)
+            duplicate = (same_total & raise_mask[:, :, None] & raise_mask[:, None, :] & earlier[None, :, :]).any(dim=2)
+            valid &= ~duplicate
+            return action_types, totals, valid, legal
+
         random_values = torch.rand((batch, width), device=self.device, generator=generator)
         span = (legal.max_raise_to - legal.min_raise_to + 1).clamp_min(1)
         sampled_totals = legal.min_raise_to[:, None] + torch.floor(random_values * span[:, None].float()).to(torch.int64)
@@ -303,6 +362,49 @@ class TensorPokerState:
             action_types[:, column] = torch.where(is_raise_slot, torch.full_like(legal.actor, RAISE_TO), action_types[:, column])
             totals[:, column] = torch.where(is_raise_slot, proposed, totals[:, column])
             valid[:, column] |= is_raise_slot
+
+        raise_mask = valid & (action_types == RAISE_TO)
+        same_total = totals[:, :, None] == totals[:, None, :]
+        earlier = torch.tril(torch.ones((width, width), dtype=torch.bool, device=self.device), diagonal=-1)
+        duplicate = (same_total & raise_mask[:, :, None] & raise_mask[:, None, :] & earlier[None, :, :]).any(dim=2)
+        valid &= ~duplicate
+        return action_types, totals, valid, legal
+
+    def cfr_candidate_actions(
+        self,
+        pot_fractions: Sequence[float] = (1.0 / 3.0, 0.75, 1.5),
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, TensorLegalActions]:
+        """Fixed semantic slots shared by CUDA Deep CFR and deployment."""
+
+        if len(pot_fractions) != 3 or any(fraction <= 0 for fraction in pot_fractions):
+            raise ValueError("CUDA Deep CFR requires exactly three positive pot fractions")
+        legal = self.legal_actions()
+        batch = self.batch_size
+        width = 8
+        action_types = torch.full((batch, width), INVALID_ACTION, dtype=torch.int64, device=self.device)
+        totals = torch.zeros((batch, width), dtype=torch.int64, device=self.device)
+        valid = torch.zeros((batch, width), dtype=torch.bool, device=self.device)
+        live = ~self.terminal
+
+        action_types[:, 0] = FOLD
+        valid[:, 0] = live & legal.facing_bet
+        action_types[:, 1] = CHECK
+        valid[:, 1] = live & ~legal.facing_bet
+        action_types[:, 2] = CALL
+        valid[:, 2] = live & legal.facing_bet
+
+        pot_after_call = self.pot() + legal.call_amount
+        raise_totals = [legal.min_raise_to]
+        raise_totals.extend(
+            self.current_bet + torch.round(pot_after_call.float() * float(fraction)).to(torch.int64)
+            for fraction in pot_fractions
+        )
+        raise_totals.append(legal.max_raise_to)
+        for slot, proposed in zip(range(3, 8), raise_totals):
+            proposed = proposed.clamp(min=legal.min_raise_to, max=legal.max_raise_to)
+            action_types[:, slot] = RAISE_TO
+            totals[:, slot] = proposed
+            valid[:, slot] = live & legal.can_raise
 
         raise_mask = valid & (action_types == RAISE_TO)
         same_total = totals[:, :, None] == totals[:, None, :]
@@ -593,6 +695,19 @@ class TensorPokerState:
         features[:, :, 9] = legal.actor_commitment.float()[:, None] / stack_before[:, None]
         features[:, :, 10] = min_raise.float()[:, None] / stack_before[:, None]
         features[:, :, 11] = max_raise.float()[:, None] / stack_before[:, None]
+        is_raise = action_types == RAISE_TO
+        pot = self.pot().clamp_min(1).float()
+        pot_after_call = (self.pot() + legal.call_amount).clamp_min(1).float()
+        features[:, :, 12] = torch.where(
+            is_raise,
+            added.float() / pot[:, None],
+            torch.zeros_like(added, dtype=torch.float32),
+        )
+        features[:, :, 13] = torch.where(
+            is_raise,
+            concrete_total.float() / pot_after_call[:, None],
+            torch.zeros_like(concrete_total, dtype=torch.float32),
+        )
         return features
 
 
@@ -698,6 +813,29 @@ class CudaReplayBuffer:
         indices = torch.randint(0, self.size, (min(batch_size, self.size),), device=self.features.device, generator=generator)
         return self.features[indices], self.targets[indices]
 
+    def state_dict(self) -> dict[str, Any]:
+        stored = self.capacity if self.size == self.capacity else self.size
+        return {
+            "capacity": self.capacity,
+            "input_dim": self.features.shape[1],
+            "features": self.features[:stored].detach().cpu(),
+            "targets": self.targets[:stored].detach().cpu(),
+            "size": self.size,
+            "cursor": self.cursor,
+            "samples_seen": self.samples_seen,
+        }
+
+    def load_state_dict(self, payload: dict[str, Any]) -> None:
+        if int(payload["capacity"]) != self.capacity or int(payload["input_dim"]) != self.features.shape[1]:
+            raise ValueError("Replay snapshot shape does not match the configured CUDA replay buffer")
+        features = payload["features"].to(self.features.device)
+        targets = payload["targets"].to(self.targets.device)
+        self.features[: features.shape[0]].copy_(features)
+        self.targets[: targets.shape[0]].copy_(targets)
+        self.size = int(payload["size"])
+        self.cursor = int(payload["cursor"])
+        self.samples_seen = int(payload["samples_seen"])
+
 
 class GpuPrefixBranchTrainer:
     """Batched prefix branching, rollout, replay, and learning on one CUDA GPU."""
@@ -732,6 +870,10 @@ class GpuPrefixBranchTrainer:
         self.loss_sum = torch.zeros((), dtype=torch.float32, device=device)
         self.optimizer_updates = 0
         self.decision_checkpoints = 0
+        self.street_decisions = torch.zeros((4,), dtype=torch.int64, device=device)
+        self.candidate_action_counts = torch.zeros((4,), dtype=torch.int64, device=device)
+        self.selected_action_counts = torch.zeros((4,), dtype=torch.int64, device=device)
+        self.completed_hands = 0
 
     def train(
         self,
@@ -758,29 +900,102 @@ class GpuPrefixBranchTrainer:
         final_steps = self.config.final_epochs * max(1, math.ceil(self.replay.size / self.config.batch_size))
         for _ in range(final_steps):
             self._optimizer_step()
+        self.completed_hands += iterations
         return {
-            "iterations": iterations,
+            "iterations": self.completed_hands,
+            "new_iterations": iterations,
             "decision_checkpoints": self.decision_checkpoints,
             "generated_samples": self.replay.samples_seen,
             "training_samples": self.replay.size,
             "optimizer_updates": self.optimizer_updates,
+            "decision_checkpoints_by_street": {
+                name: int(self.street_decisions[index].item()) for index, name in enumerate(STREET_NAMES)
+            },
+            "candidate_actions_by_type": {
+                name: int(self.candidate_action_counts[index].item()) for index, name in enumerate(ACTION_NAMES)
+            },
+            "selected_actions_by_type": {
+                name: int(self.selected_action_counts[index].item()) for index, name in enumerate(ACTION_NAMES)
+            },
             "loss": [float((self.loss_sum / max(1, self.optimizer_updates)).item())],
             "amp": self.amp_enabled,
             "amp_dtype": str(self.amp_dtype).removeprefix("torch.") if self.amp_enabled else None,
         }
 
+    def snapshot_payload(self) -> dict[str, Any]:
+        return {
+            "snapshot_version": GPU_TRAINING_SNAPSHOT_VERSION,
+            "algorithm": "tensorized_cuda_prefix_branch_mc",
+            "table_config": {
+                "seats": self.table_config.seats,
+                "small_blind": self.table_config.small_blind,
+                "big_blind": self.table_config.big_blind,
+                "starting_stacks": list(self.table_config.starting_stacks),
+            },
+            "training_config": asdict(self.config),
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
+            "replay": self.replay.state_dict(),
+            "generator_state": self.generator.get_state().cpu(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_states": [state.cpu() for state in torch.cuda.get_rng_state_all()],
+            "completed_hands": self.completed_hands,
+            "optimizer_updates": self.optimizer_updates,
+            "decision_checkpoints": self.decision_checkpoints,
+            "loss_sum": self.loss_sum.detach().cpu(),
+            "street_decisions": self.street_decisions.detach().cpu(),
+            "candidate_action_counts": self.candidate_action_counts.detach().cpu(),
+            "selected_action_counts": self.selected_action_counts.detach().cpu(),
+        }
+
+    def save_snapshot(self, path: str | Path) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.snapshot_payload(), target)
+
+    def load_snapshot(self, path: str | Path) -> None:
+        payload = torch.load(Path(path), map_location=self.device, weights_only=False)
+        if int(payload.get("snapshot_version", -1)) != GPU_TRAINING_SNAPSHOT_VERSION:
+            raise ValueError(f"Unsupported GPU training snapshot version: {payload.get('snapshot_version')}")
+        expected_table = {
+            "seats": self.table_config.seats,
+            "small_blind": self.table_config.small_blind,
+            "big_blind": self.table_config.big_blind,
+            "starting_stacks": list(self.table_config.starting_stacks),
+        }
+        if payload["table_config"] != expected_table or payload["training_config"] != asdict(self.config):
+            raise ValueError("GPU training snapshot configuration does not match this trainer")
+        self.model.load_state_dict(payload["model_state_dict"])
+        self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+        self.scaler.load_state_dict(payload["scaler_state_dict"])
+        self.replay.load_state_dict(payload["replay"])
+        self.generator.set_state(payload["generator_state"].cpu())
+        torch.set_rng_state(payload["torch_rng_state"].cpu())
+        torch.cuda.set_rng_state_all([state.cpu() for state in payload["cuda_rng_states"]])
+        self.completed_hands = int(payload["completed_hands"])
+        self.optimizer_updates = int(payload["optimizer_updates"])
+        self.decision_checkpoints = int(payload["decision_checkpoints"])
+        self.loss_sum.copy_(payload["loss_sum"].to(self.device))
+        self.street_decisions.copy_(payload["street_decisions"].to(self.device))
+        self.candidate_action_counts.copy_(payload["candidate_action_counts"].to(self.device))
+        self.selected_action_counts.copy_(payload["selected_action_counts"].to(self.device))
+
     def _train_hand_batch(self, state: TensorPokerState) -> None:
         width = self.config.branch_width
+        replicas = self.config.chance_replicas
         for _ in range(self.config.max_decisions_per_hand):
             active_indices = torch.nonzero(~state.terminal, as_tuple=False).squeeze(1)
             if active_indices.numel() == 0:
                 break
             state = state.index_select(active_indices)
             actors = state.current_actor.clone()
+            self.street_decisions += torch.bincount(state.street, minlength=4)[:4]
             action_types, totals, valid, legal = state.candidate_actions(
                 width,
                 self.generator,
                 self.config.required_integer_actions,
+                self.config.pot_fractions,
             )
             state_features = state.state_features()
             trajectory_features = state.trajectory_features()
@@ -794,20 +1009,23 @@ class GpuPrefixBranchTrainer:
                 dim=2,
             )
 
-            branch_states = state.repeat_interleave(width)
-            flat_valid = valid.reshape(-1)
+            branch_states = state.repeat_chance_actions(replicas, width, self.generator)
+            expanded_valid = valid[:, None, :].expand(-1, replicas, -1)
+            expanded_types = action_types[:, None, :].expand(-1, replicas, -1)
+            expanded_totals = totals[:, None, :].expand(-1, replicas, -1)
+            flat_valid = expanded_valid.reshape(-1)
             branch_states.terminal[~flat_valid] = True
             branch_states.current_actor[~flat_valid] = -1
-            branch_states.apply_actions(action_types.reshape(-1), totals.reshape(-1), flat_valid)
+            branch_states.apply_actions(expanded_types.reshape(-1), expanded_totals.reshape(-1), flat_valid)
             immediate_states = branch_states.clone()
             branch_states.rollout(self.config.max_rollout_actions, self.generator)
-            utilities = branch_states.utilities()
-            repeated_actors = actors.repeat_interleave(width)
-            rows = torch.arange(branch_states.batch_size, device=self.device)
-            targets = utilities[rows, repeated_actors].reshape(state.batch_size, width)
+            utilities = branch_states.utilities().reshape(state.batch_size, replicas, width, state.seats)
+            actor_indices = actors[:, None, None, None].expand(-1, replicas, width, 1)
+            targets = utilities.gather(3, actor_indices).squeeze(3).mean(dim=1)
             targets = targets / state.starting_stacks[actors].float()[:, None]
 
             self.replay.add(features[valid], targets[valid])
+            self.candidate_action_counts += torch.bincount(action_types[valid], minlength=4)[:4]
             self.decision_checkpoints += state.batch_size
             if self.replay.size >= self.config.replay_warmup:
                 for _ in range(self.config.optimizer_steps_per_decision):
@@ -822,7 +1040,19 @@ class GpuPrefixBranchTrainer:
                 greedy_choice = policy_scores.argmax(dim=1)
                 explore = torch.rand((state.batch_size,), device=self.device, generator=self.generator) < self.config.epsilon
                 chosen = torch.where(explore, random_choice, greedy_choice)
-            flat_choice = torch.arange(state.batch_size, device=self.device) * width + chosen
+                selected_types = action_types.gather(1, chosen[:, None]).squeeze(1)
+                self.selected_action_counts += torch.bincount(selected_types, minlength=4)[:4]
+            chosen_replica = torch.randint(
+                0,
+                replicas,
+                (state.batch_size,),
+                device=self.device,
+                generator=self.generator,
+            )
+            flat_choice = (
+                (torch.arange(state.batch_size, device=self.device) * replicas + chosen_replica) * width
+                + chosen
+            )
             state = immediate_states.index_select(flat_choice)
 
     def _optimizer_step(self) -> None:

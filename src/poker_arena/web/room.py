@@ -58,6 +58,7 @@ class PokerRoom:
         self.seed = seed
         self.bot_policy_factory = bot_policy_factory
         self.reveal_all_hole_cards = reveal_all_hole_cards
+        self.game_started = False
         self.seats = [RoomSeat(seat_id=seat_id) for seat_id in range(MAX_SEATS)]
         self.table: Table | None = None
         self.display_to_engine: dict[int, int] = {}
@@ -83,8 +84,8 @@ class PokerRoom:
         seat.nickname = cleaned
         seat.token = token
         seat.bot_policy = None
-        self._ensure_hand_started()
-        self.advance_bots()
+        if self.game_started:
+            self.advance_bots()
         return {"seat_id": seat_id, "nickname": cleaned, "seat_token": token}
 
     def reserve_bot(self, host_token: str, seat_id: int) -> dict[str, Any]:
@@ -98,10 +99,22 @@ class PokerRoom:
         seat.nickname = f"Bot {seat_id + 1}" if policy is not None else f"Bot {seat_id + 1} (.pt pending)"
         seat.token = None
         seat.bot_policy = policy
-        self._ensure_hand_started()
-        if any(existing.kind == "human" for existing in self.seats):
+        if self.game_started and any(existing.kind == "human" for existing in self.seats):
             self.advance_bots()
         return seat.public_dict()
+
+    def start_game(self, host_token: str) -> dict[str, Any]:
+        self._require_host(host_token)
+        if self.game_started:
+            raise ValueError("The game has already started")
+        active_seats = [seat for seat in self.seats if seat.occupied and seat.stack > 0]
+        if len(active_seats) < 2:
+            raise ValueError("At least two occupied seats are required to start the game")
+
+        self.game_started = True
+        self._ensure_hand_started()
+        self.advance_bots()
+        return self.snapshot_for()
 
     def submit_action(self, seat_token: str, action: Action) -> dict[str, Any]:
         display_seat = self._seat_for_token(seat_token)
@@ -198,6 +211,9 @@ class PokerRoom:
         return {
             "room_code": self.room_code,
             "settings": {"starting_stack": STARTING_STACK, "small_blind": SMALL_BLIND, "big_blind": BIG_BLIND},
+            "game_started": self.game_started,
+            "can_start_game": not self.game_started
+            and sum(seat.occupied and seat.stack > 0 for seat in self.seats) >= 2,
             "status": status["status"],
             "paused_reason": status["paused_reason"],
             "seats": self._seat_payloads(),
@@ -228,13 +244,14 @@ class PokerRoom:
         return {
             "room_code": self.room_code,
             "seat_id_space": "display",
+            "game_started": self.game_started,
             "settings": {"starting_stack": STARTING_STACK, "small_blind": SMALL_BLIND, "big_blind": BIG_BLIND},
             "seats": [seat.public_dict() for seat in self.seats],
             "hands": hands,
         }
 
     def _ensure_hand_started(self) -> None:
-        if self.table is not None:
+        if not self.game_started or self.table is not None:
             return
         active_display_seats = [seat.seat_id for seat in self.seats if seat.occupied and seat.stack > 0]
         if len(active_display_seats) < 2:
@@ -360,6 +377,10 @@ class PokerRoom:
         return self.engine_to_display[engine_seat]
 
     def _status(self, current_actor: int | None) -> dict[str, str | None]:
+        if not self.game_started:
+            occupied = [seat for seat in self.seats if seat.occupied and seat.stack > 0]
+            reason = "Waiting for host to start game" if len(occupied) >= 2 else "Waiting for players"
+            return {"status": "waiting", "paused_reason": reason}
         if self.table is not None and self.table.current_hand is not None and self.table.current_hand.is_terminal:
             return {"status": "finished", "paused_reason": "Hand complete - review the river and result"}
         occupied = [seat for seat in self.seats if seat.occupied and seat.stack > 0]

@@ -40,6 +40,25 @@ class ActionAbstractionTests(unittest.TestCase):
         self.assertLess(abs(first.pot_ratio - second.pot_ratio), 0.01)
         self.assertLess(abs(first.stack_ratio - second.stack_ratio), 0.01)
 
+    def test_compact_abstraction_uses_pot_after_call_and_deduplicates_totals(self):
+        table = Table(TableConfig(seats=2, small_blind=5, big_blind=10, starting_stacks=[200, 200], seed=7))
+        state = table.start_hand()
+        state = table.apply(Action.raise_to(40))
+        state = table.apply(Action.call())
+        abstraction = ActionAbstraction.compact()
+
+        actions = abstraction.actions_for(state, state.current_actor)
+        raises = [action for action in actions if action.total is not None]
+
+        self.assertIn("third_pot", [action.label for action in raises])
+        self.assertIn("three_quarter_pot", [action.label for action in raises])
+        self.assertIn("overbet", [action.label for action in raises])
+        self.assertEqual(len({action.total for action in raises}), len(raises))
+        third = next(action for action in raises if action.label == "third_pot")
+        legal = state.legal_actions(state.current_actor)
+        expected = legal.current_bet + round((state.total_pot + legal.call_amount) / 3.0)
+        self.assertEqual(third.total, max(legal.min_raise_to, min(legal.max_raise_to, expected)))
+
 
 class TrajectoryEmbeddingTests(unittest.TestCase):
     def test_event_contexts_use_exact_snapshot_state_before_actions(self):

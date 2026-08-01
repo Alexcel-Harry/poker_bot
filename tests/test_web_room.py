@@ -77,12 +77,35 @@ class PokerRoomSecurityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             room.reserve_bot(host_token=room.host_token, seat_id=0)
 
+    def test_only_host_can_start_game_after_two_seats_are_ready(self):
+        room = PokerRoom(seed=11)
+        room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+
+        with self.assertRaises(ValueError):
+            room.start_game(host_token=room.host_token)
+
+        room.join(room_code=room.room_code, seat_id=1, nickname="Grace")
+        self.assertIsNone(room.table)
+        self.assertFalse(room.snapshot_for()["game_started"])
+        self.assertTrue(room.snapshot_for()["can_start_game"])
+        with self.assertRaises(PermissionError):
+            room.start_game(host_token="bad-token")
+
+        room.start_game(host_token=room.host_token)
+
+        self.assertIsNotNone(room.table)
+        self.assertTrue(room.snapshot_for()["game_started"])
+        self.assertFalse(room.snapshot_for()["can_start_game"])
+        with self.assertRaises(ValueError):
+            room.start_game(host_token=room.host_token)
+
 
 class PokerRoomPlayTests(unittest.TestCase):
     def test_player_payload_only_contains_own_private_cards(self):
         room = PokerRoom(seed=7)
         ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
         grace = room.join(room_code=room.room_code, seat_id=1, nickname="Grace")
+        room.start_game(host_token=room.host_token)
 
         ada_payload = room.snapshot_for(seat_token=ada["seat_token"])
         grace_payload = room.snapshot_for(seat_token=grace["seat_token"])
@@ -98,6 +121,7 @@ class PokerRoomPlayTests(unittest.TestCase):
         room = PokerRoom(seed=7)
         ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
         grace = room.join(room_code=room.room_code, seat_id=1, nickname="Grace")
+        room.start_game(host_token=room.host_token)
 
         self.assertEqual(room.snapshot_for()["current_actor"], 0)
         with self.assertRaises(PermissionError):
@@ -109,6 +133,7 @@ class PokerRoomPlayTests(unittest.TestCase):
         room = PokerRoom(seed=7)
         ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
         room.reserve_bot(host_token=room.host_token, seat_id=1)
+        room.start_game(host_token=room.host_token)
 
         room.submit_action(seat_token=ada["seat_token"], action=Action.call())
         payload = room.snapshot_for(seat_token=ada["seat_token"])
@@ -121,6 +146,7 @@ class PokerRoomPlayTests(unittest.TestCase):
         room = PokerRoom(seed=7, bot_policy_factory=lambda _seat_id: CheckCallBot())
         ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
         room.reserve_bot(host_token=room.host_token, seat_id=1)
+        room.start_game(host_token=room.host_token)
 
         room.submit_action(seat_token=ada["seat_token"], action=Action.call())
         payload = room.snapshot_for(seat_token=ada["seat_token"])
@@ -140,17 +166,20 @@ class PokerRoomPlayTests(unittest.TestCase):
         room = PokerRoom(seed=7)
         ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
         room.join(room_code=room.room_code, seat_id=1, nickname="Grace")
+        room.start_game(host_token=room.host_token)
 
         legal = room.snapshot_for(seat_token=ada["seat_token"])["legal_actions"]
 
         self.assertTrue(legal["can_raise"])
         self.assertEqual(legal["min_raise_to"], 40)
 
-    def test_policy_backed_bot_auto_advances_when_human_join_starts_hand(self):
+    def test_policy_backed_bot_auto_advances_when_host_starts_game(self):
         room = PokerRoom(seed=7, bot_policy_factory=lambda _seat_id: CheckCallBot())
         room.reserve_bot(host_token=room.host_token, seat_id=0)
 
         ada = room.join(room_code=room.room_code, seat_id=1, nickname="Ada")
+        self.assertIsNone(room.table)
+        room.start_game(host_token=room.host_token)
         payload = room.snapshot_for(seat_token=ada["seat_token"])
 
         self.assertEqual(payload["status"], "playing")
@@ -160,14 +189,31 @@ class PokerRoomPlayTests(unittest.TestCase):
         room = PokerRoom(seed=7, bot_policy_factory=lambda _seat_id: CheckCallBot())
         room.reserve_bot(host_token=room.host_token, seat_id=0)
         room.reserve_bot(host_token=room.host_token, seat_id=1)
+        self.assertIsNone(room.table)
+        room.game_started = True
+        room._ensure_hand_started()
 
         with self.assertRaises(RuntimeError):
             room.advance_bots(max_actions=1)
+
+    def test_start_game_uses_every_seat_prepared_in_the_lobby(self):
+        room = PokerRoom(seed=7, bot_policy_factory=lambda _seat_id: CheckCallBot())
+        room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
+        room.reserve_bot(host_token=room.host_token, seat_id=1)
+        room.reserve_bot(host_token=room.host_token, seat_id=2)
+
+        self.assertIsNone(room.table)
+        room.start_game(host_token=room.host_token)
+
+        self.assertIsNotNone(room.table)
+        self.assertEqual(room.table.config.seats, 3)
+        self.assertEqual(set(room.display_to_engine), {0, 1, 2})
 
     def test_session_log_excludes_private_cards_and_snapshots(self):
         room = PokerRoom(seed=7)
         ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
         room.join(room_code=room.room_code, seat_id=1, nickname="Grace")
+        room.start_game(host_token=room.host_token)
         room.submit_action(seat_token=ada["seat_token"], action=Action.call())
 
         log = room.session_log(host_token=room.host_token)
@@ -184,6 +230,7 @@ class PokerRoomPlayTests(unittest.TestCase):
         room = PokerRoom(seed=7)
         ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
         room.join(room_code=room.room_code, seat_id=2, nickname="Grace")
+        room.start_game(host_token=room.host_token)
 
         room.submit_action(seat_token=ada["seat_token"], action=Action.fold())
         log = room.session_log(host_token=room.host_token)
@@ -204,6 +251,7 @@ class PokerRoomPlayTests(unittest.TestCase):
         room = PokerRoom(seed=7, reveal_all_hole_cards=True)
         ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
         room.join(room_code=room.room_code, seat_id=1, nickname="Grace")
+        room.start_game(host_token=room.host_token)
 
         snapshot = room.snapshot_for(seat_token=ada["seat_token"])
 
@@ -215,6 +263,7 @@ class PokerRoomPlayTests(unittest.TestCase):
         room = PokerRoom(seed=7, bot_policy_factory=lambda _seat_id: CheckCallBot())
         ada = room.join(room_code=room.room_code, seat_id=0, nickname="Ada")
         room.reserve_bot(host_token=room.host_token, seat_id=1)
+        room.start_game(host_token=room.host_token)
 
         while room.table is not None and room.table.current_hand is not None and not room.table.current_hand.is_terminal:
             state = room.table.current_hand
@@ -266,10 +315,12 @@ class StaticAppTests(unittest.TestCase):
         self.assertIn("seat-grid", index)
         self.assertIn("raiseByInput", index)
         self.assertIn("Raise By", index)
+        self.assertIn("startGameButton", index)
         self.assertIn("nextHandButton", index)
         self.assertIn("raiseForm", index)
         self.assertIn("seat-cards", index)
         self.assertIn("downloadLog", app_js)
+        self.assertIn('postJSON("/api/host/start-game"', app_js)
         self.assertIn("Automatic on this PC; required over LAN", index)
         self.assertIn("raise_by", app_js)
         self.assertIn("raiseByToRaiseTo", app_js)
@@ -287,7 +338,7 @@ class StaticAppTests(unittest.TestCase):
         self.assertIn("debug cards: ON", app_js)
         self.assertIn("uncalled bet returned", app_js)
         self.assertNotIn("if (!hostToken) return", app_js)
-        self.assertIn("app.js?v=20260725-pot-audit-1", index)
+        self.assertIn("app.js?v=20260801-start-game-1", index)
 
     def test_web_cli_accepts_explicit_model_device_and_reveal_settings(self):
         args = build_parser().parse_args(
@@ -311,6 +362,35 @@ class StaticAppTests(unittest.TestCase):
 
 
 class HostSessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_loopback_request_can_start_prepared_game_without_host_token(self):
+        web_app = importlib.import_module("poker_arena.web.app")
+        fresh_room = PokerRoom(seed=23)
+        fresh_room.join(room_code=fresh_room.room_code, seat_id=0, nickname="Ada")
+        fresh_room.join(room_code=fresh_room.room_code, seat_id=1, nickname="Grace")
+        request = FakeRequest(client_host="127.0.0.1", payload={"host_token": ""})
+
+        with patch.object(web_app, "room", fresh_room):
+            response = await web_app.host_start_game(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(fresh_room.game_started)
+        self.assertIsNotNone(fresh_room.table)
+        self.assertIn(web_app.HOST_SESSION_COOKIE, response.headers["set-cookie"])
+
+    async def test_remote_request_cannot_start_game_without_host_token(self):
+        web_app = importlib.import_module("poker_arena.web.app")
+        fresh_room = PokerRoom(seed=23)
+        fresh_room.join(room_code=fresh_room.room_code, seat_id=0, nickname="Ada")
+        fresh_room.join(room_code=fresh_room.room_code, seat_id=1, nickname="Grace")
+        request = FakeRequest(client_host="192.0.2.10", payload={"host_token": ""})
+
+        with patch.object(web_app, "room", fresh_room):
+            response = await web_app.host_start_game(request)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(fresh_room.game_started)
+        self.assertIsNone(fresh_room.table)
+
     async def test_loopback_request_can_reserve_bot_without_host_token(self):
         web_app = importlib.import_module("poker_arena.web.app")
         fresh_room = PokerRoom(seed=23)

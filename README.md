@@ -24,6 +24,7 @@ The project currently targets one Windows workstation with an NVIDIA RTX 5070 Ti
 - `CheckCallBot`: checks when possible and otherwise calls.
 - `RandomLegalBot`: samples from currently legal actions.
 - `TorchPolicyBot`: loads a self-describing `.pt` checkpoint, scores legal concrete actions, and chooses the highest-scoring action.
+- `DeepCFRAveragePolicyBot`: loads a multi-player Deep CFR average-strategy checkpoint and samples the learned legal-action distribution for its acting seat.
 - One loaded Torch policy is shared by all reserved bot seats in a web-room process.
 - Debug card reveal changes only the human-facing snapshot; bots still receive player views with opponents' hole cards hidden.
 
@@ -87,6 +88,11 @@ Examples:
   -ModelPath runs\poker_policy_gpu_100k.pt `
   -Port 8100
 
+# Play against the completed three-player, 500-iteration Deep CFR policy.
+.\scripts\run_poker_arena.ps1 `
+  -ModelPath runs\cuda_deep_cfr_3p_500_policy.pt `
+  -Device cuda
+
 # Listen on the trusted local network.
 .\scripts\run_poker_arena.ps1 -Lan
 ```
@@ -113,6 +119,8 @@ CLI options:
 
 The launcher validates both the conda Python executable and checkpoint before starting. The checkpoint is loaded lazily when the first model-backed bot is reserved.
 
+Use the 5.70 MB inference policy with the GUI, not the 3.85 GB resumable training snapshot. The checkpoint loader detects the Deep CFR policy format automatically; no inference code or GUI configuration change is required.
+
 The server prints a private host URL and a guest URL. Open the newly printed host URL after every restart. LAN mode uses plain HTTP and is intended only for trusted local networks; it is not a public deployment configuration.
 
 ## Playing and logs
@@ -121,8 +129,17 @@ The server prints a private host URL and a guest URL. Open the newly printed hos
 2. Open the printed host URL.
 3. Claim a human seat with the displayed room code and a nickname.
 4. Reserve one or more bots in unoccupied seats.
-5. Play the hand and use **Next Hand** after reviewing a completed result.
-6. Use **Download Log** to save the session JSON.
+5. Press **Start Game** after every intended player and bot has occupied a seat. Joining or reserving seats does not deal a hand.
+6. Play the hand and use **Next Hand** after reviewing a completed result.
+7. Use **Download Log** to save the session JSON.
+
+The host can start with any supported table size of at least two occupied seats. Joining humans or reserving bots only prepares the lobby: the backend cannot create the first table or deal cards until the authenticated host presses **Start Game**. The button remains disabled until at least two seats are occupied and becomes disabled permanently after the first hand begins.
+
+For the checkpoint's intended behavior, prepare exactly three occupied seats before **Start Game** is pressed. For solo play against the 500-iteration checkpoint, claim one human seat, reserve two bot seats, and then start the game. Both bot seats share one loaded policy object, while the policy selects the strategy network corresponding to the acting engine seat.
+
+The GUI also permits this checkpoint to run at any table size from two through nine. An exact three-player table uses the corresponding trained seat network. At any other player count, inference averages the logits from all three trained seat networks and emits one runtime warning for that table size. This deliberately lifts the hard player-count failure, but it is experimental extrapolation rather than a policy trained for that game size.
+
+The browser table currently remains at 2,000 chips with 10/20 blinds (100 BB). The 500-iteration checkpoint was trained at 200 chips with 5/10 blinds (20 BB), so playing it in the current GUI is an out-of-distribution behavioral test rather than a controlled strength evaluation. This setting is intentionally unchanged; a future 100 BB training run can be selected through the same `-ModelPath` option.
 
 Session logs use zero-based numeric IDs in JSON but explicitly declare:
 
@@ -152,146 +169,155 @@ state = table.start_hand()
 state = table.apply(Action.call())
 ```
 
-## RTX 5070 Ti training
+## Deep CFR training
 
-The production training path is CUDA-only and intentionally has no silent CPU fallback. It represents complete batches of poker states as PyTorch tensors and currently processes 1,024 independent hands in parallel by default.
+The primary learning path is now three-to-nine-player external-sampling Deep CFR, with three players by default. It addresses the main limitations of the original 10k action-value checkpoint:
 
-At each decision checkpoint it:
+- A traverser decision recursively branches over every legal abstract action. Descendant traverser decisions branch again, so this is branches-over-branches rather than one flat branch followed by a random rollout.
+- Opponent and chance nodes are sampled independently. Separate traversals receive independently shuffled undealt cards while preserving the public/private prefix already observed.
+- The current policy is derived from positive predicted counterfactual regrets. Deployment uses a separately learned average strategy and samples its action distribution; it is not deterministic `argmax` and does not hardcode bluff frequencies.
+- Bet sizing uses a compact legal abstraction: fold/check/call, minimum raise, one-third-pot, three-quarter-pot, 1.5x-pot, and all-in. Duplicate concrete raise totals are removed for short stacks.
+- Every seat has its own advantage network, average-strategy network, and two reservoir memories. Early data is not simply overwritten by recent play.
 
-1. Generates concrete legal fold/check/call/raise candidates.
-2. Repeats each tensor state across the branch width.
-3. Applies each candidate from the shared prefix.
-4. Rolls branches to terminal states on CUDA.
-5. Uses the acting player's terminal utility as the action-value target.
-6. Stores features and targets in a CUDA-resident replay buffer.
-7. Updates an `ActionValueNet` with AdamW and mixed precision.
-8. Continues the training trajectory with epsilon-greedy action selection.
+The implementation has two paths that share the same policy format:
 
-State transitions, legal actions, shuffled deals, street dealing, best-of-seven evaluation, terminal settlement, feature construction, replay sampling, inference, and optimization remain on the GPU. Python coordinates batches and writes checkpoint and summary files.
+- `examples\train_deep_cfr.py` is the readable recursive reference trainer. It supports two-player Kuhn/Leduc validation and three-to-nine-player Hold'em experiments.
+- `examples\train_cuda_deep_cfr.py` is the production single-GPU trainer. It executes traversals as level-synchronous CUDA frontiers, expands every traverser action, samples one action at each non-traverser node, and back-propagates the selected traverser's terminal value through the recorded frontier.
 
-### 10k demonstration checkpoint
+The exact Nash-convergence guarantee associated with CFR is specific to two-player zero-sum games. Multi-player poker remains constant-sum, but independent regret minimization is not guaranteed to converge to a Nash equilibrium. The three-player trainer is therefore an intentional practical extension whose checkpoints must be judged empirically, not labeled solved from training loss alone.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\train_rtx5070ti.ps1 `
-  -Iterations 10000 `
-  -ModelOut runs\poker_policy_gpu.pt
-```
+### Validation gates
 
-The current 10k run recorded:
-
-- 10,000 generated hands
-- 83,849 decision checkpoints
-- 2,171,567 generated branch samples
-- 250,000 retained replay samples
-- 779 optimizer updates
-- bfloat16 automatic mixed precision
-
-These values are recorded in `runs\training_summary_gpu.json`.
-
-### 100k comparison experiment
-
-A 100k run is a useful next experiment, but write it to a separate checkpoint so the 10k baseline remains available:
+Kuhn and Leduc include exact game trees, exact expected value, an infoset-consistent exact best response, NashConv/exploitability, and a tabular CFR baseline. Use them before changing traversal, regret, or averaging logic:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\train_rtx5070ti.ps1 `
-  -Iterations 100000 `
-  -ModelOut runs\poker_policy_gpu_100k.pt
+C:\conda_envs\poker_ai_env\python.exe -B .\examples\train_deep_cfr.py `
+  --game kuhn `
+  --iterations 100 `
+  --snapshot-out runs\kuhn_snapshot.pt `
+  --policy-out runs\kuhn_policy.pt `
+  --summary-out runs\kuhn_summary.json
 ```
 
-The script currently writes its summary to `runs\training_summary_gpu.json`, so copy or rename the 10k summary before starting if both summaries must be retained. Training starts from a fresh model; checkpoint resume is not currently implemented.
+The toy-game summary records expected values, best-response values, NashConv, and exploitability. Exact exploitability is deliberately not claimed for full Hold'em.
 
-The equivalent fully configurable command is:
+### Production RTX 5070 Ti run
+
+Start with a short smoke run, inspect the summary, and only then scale the iteration and traversal counts:
 
 ```powershell
-C:\conda_envs\poker_ai_env\python.exe -B .\examples\train_gpu_prefix_branch.py `
-  --device cuda `
-  --gpus 0 `
-  --iterations 100000 `
-  --parallel-hands 1024 `
-  --branch-width 32 `
-  --max-decisions-per-hand 64 `
-  --max-rollout-actions 128 `
-  --replay-capacity 250000 `
-  --replay-warmup 8192 `
-  --batch-size 8192 `
-  --optimizer-steps-per-decision 2 `
-  --final-epochs 3 `
-  --learning-rate 0.0005 `
-  --epsilon 0.15 `
-  --model-out runs\poker_policy_gpu_100k.pt `
-  --summary-out runs\training_summary_gpu_100k.json
+powershell -ExecutionPolicy Bypass -File .\scripts\train_cuda_deep_cfr.ps1 `
+  -Iterations 5 `
+  -TraversalsPerPlayer 256 `
+  -ParallelTraversals 64 `
+  -Seats 3 `
+  -SnapshotOut runs\cuda_deep_cfr_smoke_snapshot.pt `
+  -PolicyOut runs\cuda_deep_cfr_smoke_policy.pt
 ```
 
-Important controls:
+For a longer run:
 
-- `--parallel-hands`: main GPU memory/throughput control.
-- `--branch-width`: number of concrete candidate actions evaluated per state.
-- `--max-rollout-actions`: safety bound for a rollout.
-- `--replay-capacity`: number of action-value samples retained on CUDA.
-- `--epsilon`: probability of a random continuation choice during training only.
-- `--required-integer-actions`: exact raise totals that must be considered when legal.
-- `--evaluator-chunk-size`: controls seven-card evaluator memory use.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\train_cuda_deep_cfr.ps1 `
+  -Iterations 100 `
+  -TraversalsPerPlayer 4096 `
+  -ParallelTraversals 512 `
+  -Seats 3 `
+  -SnapshotOut runs\cuda_deep_cfr_snapshot.pt `
+  -PolicyOut runs\cuda_deep_cfr_average_policy.pt
+```
 
-## What 100k training can and cannot fix
+Resume adds the requested number of new iterations and restores every seat's networks and reservoirs, counters, and random-number-generator states. The resume seat count must match the snapshot. Runtime-only controls such as iteration count, parallel traversal count, and frontier safety limit may change safely:
 
-Increasing 10k to 100k should provide broader deal coverage, approximately an order of magnitude more optimizer work, repeated turnover of the fixed replay buffer, and lower-variance action-value estimates. It may improve basic hand valuation, bet sizing, and some obvious over-folding.
+```powershell
+.\scripts\train_cuda_deep_cfr.ps1 `
+  -Iterations 400 `
+  -Seats 3 `
+  -ParallelTraversals 512 `
+  -SnapshotEvery 100 `
+  -ResumeSnapshot runs\cuda_deep_cfr_3p_100_snapshot.pt `
+  -SnapshotOut runs\cuda_deep_cfr_3p_500_snapshot.pt `
+  -PolicyOut runs\cuda_deep_cfr_3p_500_policy.pt
+```
 
-It is not sufficient by itself to create professional bluffing or bluff-catching:
+`--snapshot-every` atomically refreshes the resumable snapshot after that many new iterations; an interrupted write cannot replace the last complete snapshot. Important production controls are `--parallel-traversals` and `--max-frontier-rows` for peak GPU memory, reservoir capacities for retained training data, and the per-network training-step counts. A completed sound traversal should report `depth_limit_rollouts: 0`; a nonzero value means the safety depth bound was reached and the configuration must be investigated before trusting that run.
 
-- `TorchPolicyBot` deploys a deterministic `argmax`; it never samples a learned mixed strategy.
-- Training epsilon produces exploration data but is not used during inference.
-- Branch targets use Monte Carlo random continuations, not counterfactual values against an equilibrium opponent.
-- The trajectory encoder is a compact summary rather than a full learned opponent-range model.
-- The trainer optimizes action values, not the average regret-matched strategy normally used to make poker policies difficult to exploit.
+Deep CFR iteration counts are not comparable to the old checkpoint's generated-hand count. Each iteration performs many player-specific traversals and recursively evaluates multiple actions.
 
-A sharper action-value model can even become more consistently "honest" if the current training distribution rewards value betting and folding. Therefore the 100k checkpoint should be treated as an empirical baseline, not as the final architecture.
+### Verified local runs (2026-08-01)
 
-Recommended evaluation compares the 10k and 100k checkpoints over many duplicate deals with seats rotated and records:
+The production path has been exercised end to end on the target RTX 5070 Ti. The 500-iteration run resumed the complete 100-iteration training snapshot, changed only runtime-safe controls, and completed successfully:
 
-- big blinds won per 100 hands
-- fold-to-bet and fold-to-raise by street
-- call efficiency and river bluff-catch frequency
-- aggression frequency and bet-size distribution
-- showdown rate and showdown profit
-- bets made with low estimated equity (bluffs) versus draws with improving equity (semi-bluffs)
-- performance against always-aggressive, tight, check/call, random, and previous-checkpoint opponents
+| Checkpoint | Training path | Parallel traversals | Total traversals | Maximum frontier rows | Depth-limit rollouts |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 100 iterations | Fresh three-player run | 256 | 1,228,800 | 64,244 | 0 |
+| 500 iterations | Resume at 100, add 400 | 512 | 6,144,000 | 124,971 | 0 |
 
-A principled stronger bot should eventually learn and deploy a probability distribution over actions from counterfactual regrets or an average self-play policy. Sampling that distribution makes bluffs and bluff-catches emerge as parts of balanced ranges. Adding a fixed "bluff percentage" or merely sampling low-value actions would add noise, not poker intelligence.
+All three advantage reservoirs and all three strategy reservoirs reached their configured capacity of 1,000,000 retained samples. The final local artifacts are `runs\cuda_deep_cfr_3p_500_snapshot.pt` (about 3.85 GB), `runs\cuda_deep_cfr_3p_500_policy.pt` (about 5.70 MB), and `runs\cuda_deep_cfr_3p_500_summary.json`. The inference policy was loaded after training, all network parameters were finite, and it produced a legal action in a three-player table. These generated artifacts remain local and are not required in the Git repository.
 
-## Other training implementations
+On the same 4,096-traversals-per-player benchmark, increasing `--parallel-traversals` from 256 to 512 reduced elapsed time from 27.76 seconds to 14.92 seconds (about 1.86x faster), while peak allocated GPU memory increased from about 4.1 GB to 5.1 GB. This is why the resumed production run uses 512.
 
-The repository retains three useful paths:
+An exploratory evaluation of the 100-iteration policy against the original 10k action-value checkpoint used 200 rotated deals, or 600 tracked-policy hands. It measured +10 BB/100 with a 95% confidence interval of -65.9 to +85.9 BB/100. The policy raised on 57% of its 984 observed decisions, so it was clearly not behaving like the earlier overly conservative deterministic bot, but the interval is much too wide to claim that it is stronger. Run completion and training loss are not strength measurements.
 
-- `examples\train_cfr.py`: small CPU sampled-CFR reference implementation.
-- `examples\train_prefix_branch.py`: CPU engine-connected prefix-branch experimentation and replay generation.
-- `examples\train_gpu_prefix_branch.py`: production tensorized CUDA Monte Carlo action-value trainer.
+The next evaluation steps are:
 
-The older finite abstraction contains fold, check, call, minimum raise, half-pot, pot, and all-in labels. The CUDA path instead keeps concrete legal integer `raise_to(total)` values as first-class actions and encodes their pot/stack ratios continuously.
+1. Evaluate the 500-iteration policy against both the 100-iteration policy and the original 10k checkpoint on at least 10,000 rotated deals per matchup.
+2. Compare grouped confidence intervals, seat-specific results, fold/call/raise frequencies by street, and raise-size distributions rather than relying only on aggregate BB/100.
+3. Review representative hand histories for value bets, bluff candidates, and bluff catches, especially on the sparsely sampled turn and river.
+4. Continue from the 500-iteration snapshot only after these comparisons show whether more traversals, a larger model, or a broader action abstraction is the most useful next investment.
 
-The project also includes deterministic `TrajectoryEncoder` features and a trainable trajectory encoder for CPU experiments.
+### Evaluation and deployment
 
-## Checkpoints
+`play_rotating_match` evaluates every shuffled deck once for each placement of the tracked policy. At three seats, the tracked checkpoint plays each deal three times—once in every seat—against two instances of the opponent. It reports a grouped 95% confidence interval and action telemetry by street, action type, facing-bet status, and raise-to-pot ratio:
 
-GPU training writes a self-describing Torch checkpoint containing:
+```python
+from poker_arena import TorchPolicyBot, play_rotating_match
 
-- checkpoint format version
-- model weights and hidden-layer configuration
-- state, trajectory, and action dimensions
-- table defaults
-- concrete-action sampler metadata
-- training metadata and statistics
-- normalization metadata
+result = play_rotating_match(
+    lambda: TorchPolicyBot.from_checkpoint("runs/cuda_deep_cfr_average_policy.pt", device="cuda"),
+    lambda: TorchPolicyBot.from_checkpoint("runs/poker_policy_gpu.pt", device="cuda"),
+    deals=10_000,
+    seats=3,
+)
+print(result.to_dict())
+```
 
-Programmatic loading:
+The average-strategy checkpoint is self-describing. The existing loader recognizes it and returns a stochastic `DeepCFRAveragePolicyBot`:
 
 ```python
 from poker_arena import TorchPolicyBot
 
 bot = TorchPolicyBot.from_checkpoint(
-    "runs/poker_policy_gpu.pt",
+    "runs/cuda_deep_cfr_average_policy.pt",
     device="cuda",
 )
 ```
+
+The policy records its trained player count. A matching table selects the corresponding seat-specific strategy network; a mismatched two-to-nine-player table uses the explicitly warned ensemble fallback described above. Preserve the original 10k checkpoint as a baseline and compare checkpoints on rotated duplicate deals rather than judging a few manually selected hands. Bluffing is expected to emerge as part of the learned mixed strategy, but it still needs empirical validation; the architecture does not guarantee a strong policy after a short run.
+
+## Improved prefix-branch baseline
+
+The original CUDA action-value trainer remains available as a controlled baseline. It now uses the same compact pot-sized candidates, adds explicit `added / pot` and `total / (pot + call)` action features, averages each sibling action over independently reshuffled future-card replicas, records candidate/selection telemetry, and writes a fully resumable training snapshot. The loader retains the 12-feature path required by existing checkpoints:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\train_rtx5070ti.ps1 `
+  -Iterations 10000 `
+  -BranchWidth 8 `
+  -ChanceReplicas 4 `
+  -ModelOut runs\poker_policy_gpu_v2.pt `
+  -TrainingSnapshotOut runs\poker_policy_gpu_v2_training.pt
+```
+
+Resume with `-ResumeSnapshot`. This baseline is still Monte Carlo action-value learning with epsilon-greedy continuations and deterministic inference, so more steps alone should not be expected to solve balanced bluffing.
+
+## Training artifacts
+
+Training snapshots and inference policies are intentionally separate:
+
+- snapshots contain optimizer/training state, networks, replay or reservoir contents, RNG states, counters, and telemetry needed for an exact continuation;
+- inference policies contain only the schema, encoders, learned policy networks, and training metadata required to play.
+
+Other retained implementations are `examples\train_cfr.py` (small sampled-CFR reference), `examples\train_prefix_branch.py` (CPU engine-connected prefix branching), and `examples\train_gpu_prefix_branch.py` (CUDA Monte Carlo baseline).
 
 ## Tests
 
@@ -301,29 +327,37 @@ Run the complete suite without writing Python bytecode or pytest cache files:
 C:\conda_envs\poker_ai_env\python.exe -B -m pytest -p no:cacheprovider -q
 ```
 
-The suite covers cards, evaluator rankings, betting rules, all-in runouts, side pots, uncalled returns, stable web-seat IDs, session logs, host authentication, browser assets, bots, CPU CFR components, Torch checkpoints, CUDA CLI configuration, and tensor/reference-engine agreement.
+The suite covers cards, evaluator rankings, betting rules, all-in runouts, side pots, uncalled returns, stable web-seat IDs, session logs, host authentication, browser assets, bots, exact Kuhn/Leduc exploitability, three-player recursive and CUDA Deep CFR, reservoir sampling, resumable snapshots, seat-rotated duplicate-deal evaluation, CUDA CLI configuration, and tensor/reference-engine agreement.
 
 ## Project layout
 
 ```text
 src/poker_arena/                 rules engine, views, events, bots
-src/poker_arena/cfr/             CPU CFR, feature encoders, Torch model, CUDA trainer
+src/poker_arena/cfr/             toy games, exact evaluation, Deep CFR, CUDA trainers
+src/poker_arena/evaluation_arena.py  duplicate/rotated-deal policy evaluation and telemetry
 src/poker_arena/web/             FastAPI room/server and browser assets
 examples/                        headless and training entry points
 scripts/bootstrap_windows.ps1    conda/CUDA environment setup
 scripts/run_poker_arena.ps1      environment-isolated web launcher
 scripts/train_rtx5070ti.ps1      single-GPU training launcher
+scripts/train_cuda_deep_cfr.ps1  production 3-9 player Deep CFR launcher
 tests/                           automated test suite
 runs/                            checkpoints and training summaries
 ```
 
 ## Current limitations
 
-- The trained web bot is deterministic and does not yet deploy a balanced mixed strategy.
-- The CUDA trainer is an action-value Monte Carlo prefix-branch method, not a converged Deep CFR implementation.
-- No checkpoint-resume or league-training workflow is implemented.
-- No automated exploitability or best-response benchmark is implemented.
+- Production Deep CFR training uses one fixed 3-9-player table size and stores a separate policy/memory set for every trained seat. Inference at a different 2-9-player table size is allowed through an ensemble fallback, but remains out of distribution until training itself mixes player counts or uses a shared strategy network.
+- Multi-player CFR does not inherit the two-player zero-sum Nash-convergence guarantee, so rotated empirical evaluation is mandatory.
+- Full Hold'em is evaluated empirically; exact exploitability and exact best response are available only for the finite Kuhn/Leduc validation games.
+- The compact action abstraction cannot represent every legal integer bet size.
+- No league-training workflow is implemented.
+- A trained average strategy is not assumed converged merely because the pipeline completed; compare it against baselines with duplicate deals and confidence intervals.
 - The web room is in-memory; restarting the process creates a new room and host token.
 - Downloaded logs expose all hole cards for debugging.
 - LAN mode has no TLS and must remain on a trusted network.
 - Odd split-pot chips currently carry into the next hand rather than following a casino-specific odd-chip assignment rule.
+
+## Acknowledgment
+
+Great thanks to Codex and ChatGPT for implementing the codebase.

@@ -1,5 +1,7 @@
 import random
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -9,11 +11,12 @@ from poker_arena.cfr.gpu_prefix_branch import (
     CALL,
     FOLD,
     GpuPrefixBranchTrainingConfig,
+    GpuPrefixBranchTrainer,
     TensorPokerState,
     evaluate_seven_card_hands,
 )
 from poker_arena.cfr.prefix_branch import ActionEmbedding
-from poker_arena.cfr.torch_model import StateFeatureEncoder
+from poker_arena.cfr.torch_model import ActionValueNet, StateFeatureEncoder
 from poker_arena.embedding import TrajectoryEncoder
 from poker_arena.evaluator import evaluate_best
 from poker_arena.table import TableConfig
@@ -51,6 +54,29 @@ class TensorPokerEngineTests(unittest.TestCase):
 
         self.assertTrue(torch.equal(state.stacks, before))
         self.assertEqual(branches.batch_size, 32)
+
+    def test_chance_replicas_share_decks_within_actions_but_differ_between_replicas(self):
+        state = TensorPokerState.new_batch(self.table_config, 2, self.device, self.generator)
+        branches = state.repeat_chance_actions(chance_replicas=3, action_width=4, generator=self.generator)
+        decks = branches.deck.reshape(2, 3, 4, 52)
+
+        self.assertTrue(torch.equal(decks[:, :, 0], decks[:, :, 1]))
+        self.assertTrue(torch.equal(decks[:, :, 0], decks[:, :, 3]))
+        self.assertFalse(torch.equal(decks[:, 0, 0], decks[:, 1, 0]))
+        dealt = int(state.next_card[0])
+        self.assertTrue(torch.equal(decks[0, 0, 0, :dealt], state.deck[0, :dealt]))
+
+    def test_compact_tensor_candidates_are_pot_relative_and_deduplicated(self):
+        state = TensorPokerState.new_batch(self.table_config, 8, self.device, self.generator)
+        action_types, totals, valid, _legal = state.candidate_actions(
+            8,
+            self.generator,
+            pot_fractions=(1.0 / 3.0, 0.75, 1.5),
+        )
+
+        for row in range(state.batch_size):
+            raises = totals[row][valid[row] & (action_types[row] == 3)]
+            self.assertEqual(len(raises), len(torch.unique(raises)))
 
     def test_tensor_candidates_do_not_offer_fold_when_check_is_free(self):
         state = TensorPokerState.new_batch(TableConfig(2, 5, 10, [100, 100]), 1, self.device, self.generator)
@@ -92,7 +118,7 @@ class TensorPokerEngineTests(unittest.TestCase):
                 if action_type == 2
                 else Action.raise_to(int(totals[0, column]))
             )
-            expected = ActionEmbedding().encode(action, python_legal)
+            expected = ActionEmbedding().encode(action, python_legal, pot=reference.total_pot)
             self.assertTrue(torch.allclose(tensor_features[column], torch.tensor(expected), atol=1e-6))
 
     def test_parallel_random_rollouts_settle_to_zero_sum_terminal_utilities(self):
@@ -145,6 +171,43 @@ class TensorPokerEngineTests(unittest.TestCase):
         self.assertTrue(bool(state.terminal[0]))
         self.assertEqual(state.stacks[0].tolist(), [player.stack for player in table.current_hand.players])
 
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+class GpuTrainingSnapshotTests(unittest.TestCase):
+    def test_training_snapshot_restores_model_replay_optimizer_and_counters(self):
+        device = torch.device("cuda:0")
+        config = GpuPrefixBranchTrainingConfig(
+            branch_width=4,
+            chance_replicas=2,
+            pot_fractions=(0.5,),
+            parallel_hands=2,
+            max_decisions_per_hand=2,
+            max_rollout_actions=32,
+            replay_capacity=64,
+            replay_warmup=1,
+            batch_size=8,
+            optimizer_steps_per_decision=1,
+            final_epochs=0,
+            random_seed=31,
+            use_amp=False,
+        )
+        table = TableConfig(2, 5, 10, [40, 40])
+        input_dim = StateFeatureEncoder.dimension + 14 + ActionEmbedding.dimension_without_trajectory
+        trainer = GpuPrefixBranchTrainer(table, config, ActionValueNet(input_dim, (16,)), device)
+        trainer.train(2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gpu_training.pt"
+            trainer.save_snapshot(path)
+            restored = GpuPrefixBranchTrainer(table, config, ActionValueNet(input_dim, (16,)), device)
+            restored.load_snapshot(path)
+
+        self.assertEqual(restored.completed_hands, trainer.completed_hands)
+        self.assertEqual(restored.optimizer_updates, trainer.optimizer_updates)
+        self.assertEqual(restored.replay.samples_seen, trainer.replay.samples_seen)
+        self.assertEqual(restored.replay.cursor, trainer.replay.cursor)
+        for name, value in trainer.model.state_dict().items():
+            self.assertTrue(torch.equal(restored.model.state_dict()[name], value))
 
 if __name__ == "__main__":
     unittest.main()

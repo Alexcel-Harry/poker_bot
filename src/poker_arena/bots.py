@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -64,7 +65,12 @@ class TorchPolicyBot:
                 f"Checkpoint state dimension {state_dim} does not match encoder dimension {self.state_encoder.dimension}"
             )
         self.trajectory_encoder = TrajectoryEncoder()
-        self.action_embedding = ActionEmbedding()
+        action_dim = int(getattr(metadata, "action_dim", ActionEmbedding.legacy_dimension))
+        if action_dim not in (ActionEmbedding.legacy_dimension, ActionEmbedding.dimension_without_trajectory):
+            raise ValueError(f"Unsupported checkpoint action dimension: {action_dim}")
+        self.action_embedding = ActionEmbedding(
+            include_pot_features=action_dim == ActionEmbedding.dimension_without_trajectory
+        )
         model_config = payload.get("model_config", {})
         action_sampler = model_config.get("action_sampler", {}) if isinstance(model_config, dict) else {}
         self.integer_action_budget = int(action_sampler.get("integer_action_budget", 32)) if isinstance(action_sampler, dict) else 32
@@ -72,7 +78,12 @@ class TorchPolicyBot:
         self.required_integer_actions = tuple(int(amount) for amount in required)
 
     @classmethod
-    def from_checkpoint(cls, path: str | Path, device: str = "auto") -> "TorchPolicyBot":
+    def from_checkpoint(
+        cls,
+        path: str | Path,
+        device: str = "auto",
+        seed: int | None = None,
+    ) -> "TorchPolicyBot":
         from poker_arena.cfr.torch_model import load_checkpoint, torch
 
         if torch is None:
@@ -80,6 +91,13 @@ class TorchPolicyBot:
         target_device = device
         if device == "auto":
             target_device = "cuda" if torch.cuda.is_available() else "cpu"
+        raw_payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+        if isinstance(raw_payload, dict) and raw_payload.get("algorithm") == "deep_cfr_average_strategy":
+            return DeepCFRAveragePolicyBot.from_payload(  # type: ignore[return-value]
+                raw_payload,
+                device=target_device,
+                seed=seed,
+            )
         model, metadata, payload = load_checkpoint(path, device=target_device)
         return cls(model=model, metadata=metadata, payload=payload, device=torch.device(target_device))
 
@@ -94,7 +112,13 @@ class TorchPolicyBot:
         state_features = self.state_encoder.encode_view(view, legal_actions)
         trajectory_features = self.trajectory_encoder.encode_events(view.events) if view is not None else [0.0] * self.trajectory_encoder.dimension
         rows = [
-            state_features + trajectory_features + self.action_embedding.encode(action, legal_actions)
+            state_features
+            + trajectory_features
+            + self.action_embedding.encode(
+                action,
+                legal_actions,
+                pot=view.pot if view is not None else None,
+            )
             for action in candidates
         ]
         tensor = torch.tensor(rows, dtype=torch.float32, device=self.device)
@@ -135,3 +159,132 @@ class TorchPolicyBot:
                 seen.add(key)
                 result.append(action)
         return result
+
+
+class DeepCFRAveragePolicyBot:
+    """Samples the learned Deep CFR average strategy at each information set."""
+
+    def __init__(
+        self,
+        networks: list[object],
+        encoder: object,
+        payload: dict[str, object],
+        device: object,
+        seed: int | None = None,
+    ) -> None:
+        from poker_arena.abstraction import ActionAbstraction
+
+        self.networks = networks
+        self.num_players = len(networks)
+        self.encoder = encoder
+        self.payload = payload
+        self.device = device
+        self.abstraction = ActionAbstraction.compact()
+        self.rng = random.Random(seed)
+        self._warned_player_counts: set[int] = set()
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: dict[str, object],
+        device: str = "cpu",
+        seed: int | None = None,
+    ) -> "DeepCFRAveragePolicyBot":
+        from poker_arena.cfr.deep_cfr import DEEP_CFR_POLICY_VERSION, DeepCFRNetwork, torch
+        from poker_arena.cfr.holdem_deep_cfr import HoldemDeepCFRFeatureEncoder, TensorHoldemDeepCFRFeatureEncoder
+
+        if torch is None:
+            raise ModuleNotFoundError("Install the training extra to load Deep CFR policies")
+        if int(payload.get("policy_version", -1)) != DEEP_CFR_POLICY_VERSION:
+            raise ValueError(f"Unsupported Deep CFR policy version: {payload.get('policy_version')}")
+        encoder_payload = payload.get("encoder")
+        if not isinstance(encoder_payload, dict):
+            raise ValueError("Deep CFR policy is missing its encoder schema")
+        if encoder_payload.get("encoder") == "holdem_private_state_ordered_history_v1":
+            encoder = HoldemDeepCFRFeatureEncoder(int(encoder_payload["max_history_actions"]))
+        elif encoder_payload.get("encoder") == "holdem_tensor_state_trajectory_v1":
+            encoder = TensorHoldemDeepCFRFeatureEncoder()
+        else:
+            raise ValueError("Only Hold'em Deep CFR inference policies can be loaded as arena bots")
+        encoder.validate_state_dict(encoder_payload)
+        hidden = tuple(int(value) for value in payload["hidden"])  # type: ignore[arg-type]
+        target_device = torch.device(device)
+        network_states = payload.get("strategy_networks")
+        if not isinstance(network_states, list):
+            raise ValueError("Deep CFR policy is missing its average-strategy networks")
+        num_players = int(payload.get("num_players", len(network_states)))
+        if num_players < 2 or len(network_states) != num_players:
+            raise ValueError("Deep CFR policy must contain one average-strategy network per player")
+        table_config = payload.get("table_config")
+        if isinstance(table_config, dict) and int(table_config.get("seats", num_players)) != num_players:
+            raise ValueError("Deep CFR policy player count disagrees with its table configuration")
+        networks: list[object] = []
+        for state in network_states:
+            network = DeepCFRNetwork(encoder.input_dim, encoder.action_dim, hidden).to(target_device)
+            network.load_state_dict(state)
+            network.eval()
+            networks.append(network)
+        return cls(networks, encoder, payload, target_device, seed=seed)
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        path: str | Path,
+        device: str = "auto",
+        seed: int | None = None,
+    ) -> "DeepCFRAveragePolicyBot":
+        from poker_arena.cfr.deep_cfr import torch
+
+        if torch is None:
+            raise ModuleNotFoundError("Install the training extra to load Deep CFR policies")
+        target = "cuda" if device == "auto" and torch.cuda.is_available() else ("cpu" if device == "auto" else device)
+        payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise ValueError("Deep CFR checkpoint payload must be a dictionary")
+        return cls.from_payload(payload, device=target, seed=seed)
+
+    def choose_action(self, view: PlayerHandView | None, legal_actions: LegalActions) -> Action:
+        from poker_arena.cfr.deep_cfr import torch
+
+        if torch is None:
+            raise ModuleNotFoundError("Install the training extra to use Deep CFR policies")
+        if view is None:
+            return CheckCallBot().choose_action(view, legal_actions)
+        table_players = len(view.stacks)
+        if not 2 <= table_players <= 9:
+            raise ValueError(f"Deep CFR inference supports tables with 2-9 players, but received {table_players}")
+        actor = view.current_actor
+        if actor is None or actor not in view.stacks:
+            raise ValueError("Deep CFR policy requires a live actor present in the table view")
+        player_count_mismatch = table_players != self.num_players
+        if player_count_mismatch and table_players not in self._warned_player_counts:
+            warnings.warn(
+                f"Deep CFR policy was trained for {self.num_players} players but is being used with "
+                f"{table_players}; averaging its trained seat networks for experimental, "
+                "out-of-distribution inference",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._warned_player_counts.add(table_players)
+        stack = view.stacks.get(actor, legal_actions.max_raise_to or 1) + legal_actions.actor_commitment
+        abstract_actions = self.abstraction.actions_from_legal(legal_actions, pot=view.pot, stack=max(1, stack))
+        concrete = {action.label: action.to_action() for action in abstract_actions}
+        labels = list(concrete)
+        if not labels:
+            return Action.fold()
+        features = self.encoder.encode_view(view, legal_actions)
+        inputs = torch.tensor([features], dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            if player_count_mismatch:
+                outputs = torch.stack([network(inputs)[0] for network in self.networks]).mean(dim=0)
+            else:
+                outputs = self.networks[actor](inputs)[0]
+        logits = torch.stack([outputs[self.encoder.action_index[label]] for label in labels])
+        probabilities = torch.softmax(logits, dim=0).detach().cpu().tolist()
+        draw = self.rng.random()
+        cumulative = 0.0
+        for label, probability in zip(labels, probabilities):
+            cumulative += float(probability)
+            if draw <= cumulative:
+                return concrete[label]
+        return concrete[labels[-1]]

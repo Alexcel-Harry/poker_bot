@@ -57,6 +57,19 @@ class PrefixBranchTrainingTests(unittest.TestCase):
 
         self.assertLess(embedding.distance(near_a, near_b), embedding.distance(near_a, far))
 
+    def test_action_embedding_adds_pot_relative_sizes_without_breaking_legacy_checkpoints(self):
+        _table, state, actor = self.betting_state()
+        legal = state.legal_actions(actor)
+        action = Action.raise_to(123)
+
+        vector = ActionEmbedding().encode(action, legal, pot=state.total_pot)
+        legacy = ActionEmbedding(include_pot_features=False).encode(action, legal, pot=state.total_pot)
+
+        self.assertEqual(len(vector), ActionEmbedding.dimension_without_trajectory)
+        self.assertEqual(len(legacy), ActionEmbedding.legacy_dimension)
+        self.assertAlmostEqual(vector[12], (123 - legal.current_bet) / state.total_pot)
+        self.assertAlmostEqual(vector[13], 123 / (state.total_pot + legal.call_amount))
+
     def test_prefix_branch_expansion_does_not_mutate_original_table(self):
         table, state, actor = self.betting_state()
         before = state.to_snapshot()

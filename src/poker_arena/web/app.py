@@ -196,6 +196,20 @@ async def host_bots(request: Request) -> JSONResponse:
     return response
 
 
+@app.post("/api/host/start-game")
+async def host_start_game(request: Request) -> JSONResponse:
+    data = await request.json()
+    try:
+        host_token = _host_token_for_request(request, str(data.get("host_token", "")))
+        result = room.start_game(host_token=host_token)
+    except Exception as exc:
+        return _error_response(exc)
+    await manager.broadcast()
+    response = JSONResponse(result)
+    _set_host_session_cookie(response)
+    return response
+
+
 @app.get("/api/logs/session.json")
 async def session_json(request: Request, host_token: str = "") -> JSONResponse:
     try:
