@@ -2,9 +2,14 @@
 param(
     [int]$Iterations = 100,
     [int]$TraversalsPerPlayer = 4096,
-    [int]$ParallelTraversals = 256,
+    [int]$ParallelTraversals = 192,
     [ValidateRange(3, 9)]
-    [int]$Seats = 3,
+    [int]$Seats = 9,
+    [ValidateRange(3, 9)]
+    [int]$MinPlayers = 3,
+    [int]$MaxFrontierRows = 131072,
+    [int]$AdvantageCapacity = 300000,
+    [int]$StrategyCapacity = 300000,
     [int]$StartingStack = 200,
     [string]$EnvPath = "C:\conda_envs\poker_ai_env",
     [string]$SnapshotOut = "runs/cuda_deep_cfr_snapshot.pt",
@@ -15,6 +20,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($MinPlayers -gt $Seats) {
+    throw "MinPlayers cannot exceed Seats"
+}
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $EnvPath "python.exe"
 if (-not (Test-Path -LiteralPath $python)) {
@@ -28,7 +36,11 @@ try {
         "--iterations", $Iterations,
         "--traversals-per-player", $TraversalsPerPlayer,
         "--parallel-traversals", $ParallelTraversals,
+        "--max-frontier-rows", $MaxFrontierRows,
         "--seats", $Seats,
+        "--min-players", $MinPlayers,
+        "--advantage-capacity", $AdvantageCapacity,
+        "--strategy-capacity", $StrategyCapacity,
         "--starting-stack", $StartingStack,
         "--gpus", "0",
         "--snapshot-out", $SnapshotOut,

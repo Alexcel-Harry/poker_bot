@@ -24,17 +24,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--traversals-per-player", type=int, default=4096)
-    parser.add_argument("--parallel-traversals", type=int, default=256)
+    parser.add_argument("--parallel-traversals", type=int, default=192)
     parser.add_argument("--max-traversal-depth", type=int, default=128)
-    parser.add_argument("--max-frontier-rows", type=int, default=262_144)
-    parser.add_argument("--advantage-capacity", type=int, default=1_000_000)
-    parser.add_argument("--strategy-capacity", type=int, default=1_000_000)
+    parser.add_argument("--max-frontier-rows", type=int, default=131_072)
+    parser.add_argument("--advantage-capacity", type=int, default=300_000)
+    parser.add_argument("--strategy-capacity", type=int, default=300_000)
     parser.add_argument("--hidden", default="512,512,256")
     parser.add_argument("--advantage-train-steps", type=int, default=1000)
     parser.add_argument("--strategy-train-steps", type=int, default=4000)
     parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--seats", type=int, default=3, help="Player count; production training requires 3-9.")
+    parser.add_argument(
+        "--seats",
+        type=int,
+        default=9,
+        help="Maximum player count; each traversal session samples between --min-players and this value.",
+    )
+    parser.add_argument("--min-players", type=int, default=3, help="Minimum randomized player count; must be 3-9.")
     parser.add_argument("--small-blind", type=int, default=5)
     parser.add_argument("--big-blind", type=int, default=10)
     parser.add_argument("--starting-stack", type=int, default=200)
@@ -65,6 +71,8 @@ def require_single_gpu(args: argparse.Namespace, env: MutableMapping[str, str]) 
 def run_from_args(args: argparse.Namespace, env: MutableMapping[str, str] | None = None) -> dict[str, object]:
     if not 3 <= args.seats <= 9:
         raise ValueError("CUDA Deep CFR production training requires --seats between 3 and 9")
+    if not 3 <= args.min_players <= args.seats:
+        raise ValueError("--min-players must be between 3 and --seats")
     if args.snapshot_every < 0:
         raise ValueError("--snapshot-every must be non-negative")
     target_env = os.environ if env is None else env
@@ -100,6 +108,7 @@ def run_from_args(args: argparse.Namespace, env: MutableMapping[str, str] | None
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         random_seed=args.random_seed,
+        minimum_players=args.min_players,
     )
     trainer = CudaDeepCFRTrainer(table, config, device)
     if args.resume_snapshot is not None:

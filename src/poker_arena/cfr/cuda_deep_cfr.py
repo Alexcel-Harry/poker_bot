@@ -27,11 +27,11 @@ def _atomic_torch_save(payload: dict[str, Any], target: Path) -> None:
 class CudaDeepCFRConfig:
     iterations: int = 100
     traversals_per_player: int = 4096
-    parallel_traversals: int = 256
+    parallel_traversals: int = 192
     max_traversal_depth: int = 128
-    max_frontier_rows: int = 262_144
-    advantage_capacity: int = 1_000_000
-    strategy_capacity: int = 1_000_000
+    max_frontier_rows: int = 131_072
+    advantage_capacity: int = 300_000
+    strategy_capacity: int = 300_000
     hidden: tuple[int, ...] = (512, 512, 256)
     advantage_train_steps: int = 1_000
     strategy_train_steps: int = 4_000
@@ -40,6 +40,7 @@ class CudaDeepCFRConfig:
     pot_fractions: tuple[float, float, float] = (1.0 / 3.0, 0.75, 1.5)
     linear_weighting: bool = True
     random_seed: int = 17
+    minimum_players: int = 3
 
     def __post_init__(self) -> None:
         positive = (
@@ -63,6 +64,10 @@ class CudaDeepCFRConfig:
             raise ValueError("hidden must contain positive layer widths")
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be positive")
+        if not 3 <= self.minimum_players <= 9:
+            raise ValueError("minimum_players must be between 3 and 9")
+        if self.max_frontier_rows < 8:
+            raise ValueError("max_frontier_rows must allow at least one full abstract-action expansion")
 
 
 class CudaReservoirBuffer:
@@ -129,11 +134,22 @@ class CudaReservoirBuffer:
             if replacements:
                 destinations = torch.tensor(list(replacements), dtype=torch.int64, device=features.device)
                 sources = torch.tensor(list(replacements.values()), dtype=torch.int64, device=features.device)
-                self.features[destinations].copy_(features[sources])
-                self.legal_masks[destinations].copy_(legal_masks[sources])
-                self.targets[destinations].copy_(targets[sources])
-                self.iterations[destinations].fill_(float(iteration))
+                # Advanced indexing returns a temporary tensor in PyTorch, so
+                # ``self.features[destinations].copy_(...)`` does not update the
+                # reservoir.  Use indexed in-place operations on the original
+                # storage for every batched replacement.
+                self.features.index_copy_(0, destinations, features.index_select(0, sources))
+                self.legal_masks.index_copy_(0, destinations, legal_masks.index_select(0, sources))
+                self.targets.index_copy_(0, destinations, targets.index_select(0, sources))
+                self.iterations.index_fill_(0, destinations, float(iteration))
         self.samples_seen += count
+
+    def iteration_range(self) -> list[int] | None:
+        """Return the oldest and newest iteration currently retained."""
+        if self.size == 0:
+            return None
+        retained = self.iterations[: self.size]
+        return [int(retained.min().item()), int(retained.max().item())]
 
     def sample(self, batch_size: int, generator: torch.Generator) -> tuple[torch.Tensor, ...]:
         if self.size == 0:
@@ -179,7 +195,7 @@ class _FrontierLayer:
 
 
 class CudaDeepCFRTrainer:
-    """Level-synchronous external-sampling Deep CFR for multi-player Hold'em."""
+    """Level-synchronous Deep CFR with independently randomized table sizes."""
 
     def __init__(
         self,
@@ -189,6 +205,8 @@ class CudaDeepCFRTrainer:
     ) -> None:
         if table_config.seats < 3:
             raise ValueError("CUDA Deep CFR training requires at least three players")
+        if config.minimum_players > table_config.seats:
+            raise ValueError("minimum_players cannot exceed the maximum table size")
         if device.type != "cuda" or not torch.cuda.is_available():
             raise ValueError("CudaDeepCFRTrainer requires an available CUDA device")
         self.table_config = table_config
@@ -214,7 +232,13 @@ class CudaDeepCFRTrainer:
         self.traversals = 0
         self.frontier_layers = 0
         self.maximum_frontier_rows = 0
+        self.maximum_projected_frontier_rows = 0
+        self.frontier_chunk_splits = 0
         self.depth_limit_rollouts = 0
+        self.player_count_traversals = {
+            player_count: 0
+            for player_count in range(self.config.minimum_players, self.num_players + 1)
+        }
         self.losses: dict[str, list[float]] = {
             f"{kind}_{player}": []
             for kind in ("advantage", "strategy")
@@ -244,7 +268,17 @@ class CudaDeepCFRTrainer:
                 remaining = self.config.traversals_per_player
                 while remaining > 0:
                     batch = min(remaining, self.config.parallel_traversals)
-                    self._collect_batch(traverser, batch, iteration)
+                    player_counts = self._sample_player_counts(traverser, batch)
+                    unique_counts, group_sizes = torch.unique(player_counts, return_counts=True)
+                    for player_count, group_size in zip(unique_counts.tolist(), group_sizes.tolist()):
+                        session_count = int(group_size)
+                        self._collect_batch(
+                            traverser,
+                            session_count,
+                            iteration,
+                            self._table_config_for(int(player_count)),
+                        )
+                        self.player_count_traversals[int(player_count)] += session_count
                     self.traversals += batch
                     remaining -= batch
                 self.losses[f"advantage_{traverser}"].append(self._train_network(traverser, strategy=False))
@@ -255,15 +289,61 @@ class CudaDeepCFRTrainer:
             self.losses[f"strategy_{player}"].append(self._train_network(player, strategy=True))
         return self.stats()
 
-    def _collect_batch(self, traverser: int, batch_size: int, iteration: int) -> None:
+    def _sample_player_counts(self, traverser: int, batch_size: int) -> torch.Tensor:
+        """Sample one valid table size per traversal session on the CUDA RNG."""
+        minimum = max(self.config.minimum_players, traverser + 1)
+        if minimum == self.num_players:
+            return torch.full((batch_size,), self.num_players, dtype=torch.int64, device=self.device)
+        return torch.randint(
+            minimum,
+            self.num_players + 1,
+            (batch_size,),
+            dtype=torch.int64,
+            device=self.device,
+            generator=self.generator,
+        )
+
+    def _table_config_for(self, player_count: int) -> TableConfig:
+        return TableConfig(
+            player_count,
+            self.table_config.small_blind,
+            self.table_config.big_blind,
+            list(self.table_config.starting_stacks[:player_count]),
+        )
+
+    def _collect_batch(
+        self,
+        traverser: int,
+        batch_size: int,
+        iteration: int,
+        table_config: TableConfig,
+    ) -> None:
         state = TensorPokerState.new_batch(
-            self.table_config,
+            table_config,
             batch_size,
             self.device,
             self.generator,
         )
+        self._traverse_state(
+            state,
+            traverser,
+            iteration,
+            float(table_config.starting_stacks[traverser]),
+            self.config.max_traversal_depth,
+        )
+
+    def _traverse_state(
+        self,
+        state: TensorPokerState,
+        traverser: int,
+        iteration: int,
+        utility_scale: float,
+        remaining_depth: int,
+    ) -> torch.Tensor:
+        """Traverse a frontier, recursively chunking oversized projected children."""
         layers: list[_FrontierLayer] = []
-        for _depth in range(self.config.max_traversal_depth):
+        values: torch.Tensor | None = None
+        while remaining_depth > 0:
             if bool(state.terminal.all().item()):
                 break
             parent_count = state.batch_size
@@ -271,7 +351,7 @@ class CudaDeepCFRTrainer:
             action_types, totals, valid, _legal = state.cfr_candidate_actions(self.config.pot_fractions)
             logits = torch.zeros((parent_count, self.encoder.action_dim), dtype=torch.float32, device=self.device)
             live = ~state.terminal
-            for player in range(self.num_players):
+            for player in range(state.seats):
                 rows = live & (state.current_actor == player)
                 if bool(rows.any().item()):
                     self.advantage_networks[player].eval()
@@ -284,8 +364,61 @@ class CudaDeepCFRTrainer:
 
             traverser_mask = live & (state.current_actor == traverser)
             opponent_mask = live & ~traverser_mask
+            terminal_parents = torch.nonzero(state.terminal, as_tuple=False).squeeze(1)
+            traverser_edges = torch.nonzero(traverser_mask[:, None] & valid, as_tuple=False)
+            opponent_parents = torch.nonzero(opponent_mask, as_tuple=False).squeeze(1)
+            projected_rows = int(
+                terminal_parents.numel() + traverser_edges.shape[0] + opponent_parents.numel()
+            )
+            self.maximum_projected_frontier_rows = max(self.maximum_projected_frontier_rows, projected_rows)
+
+            if projected_rows > self.config.max_frontier_rows:
+                if parent_count == 1:
+                    raise RuntimeError(
+                        f"A single CUDA Deep CFR parent projected {projected_rows} rows, exceeding the "
+                        f"{self.config.max_frontier_rows}-row chunk budget"
+                    )
+                required_chunks = (projected_rows + self.config.max_frontier_rows - 1) // self.config.max_frontier_rows
+                chunk_size = max(1, (parent_count + required_chunks - 1) // required_chunks)
+                self.frontier_chunk_splits += 1
+                del (
+                    features,
+                    action_types,
+                    totals,
+                    valid,
+                    _legal,
+                    logits,
+                    live,
+                    rows,
+                    positive,
+                    normalizer,
+                    fallback,
+                    strategy,
+                    traverser_mask,
+                    opponent_mask,
+                    terminal_parents,
+                    traverser_edges,
+                    opponent_parents,
+                )
+                chunk_values: list[torch.Tensor] = []
+                for start in range(0, parent_count, chunk_size):
+                    stop = min(start + chunk_size, parent_count)
+                    indices = torch.arange(start, stop, dtype=torch.int64, device=self.device)
+                    chunk = state.index_select(indices)
+                    chunk_values.append(
+                        self._traverse_state(
+                            chunk,
+                            traverser,
+                            iteration,
+                            utility_scale,
+                            remaining_depth,
+                        )
+                    )
+                values = torch.cat(chunk_values)
+                break
+
             if bool(opponent_mask.any().item()):
-                for opponent in range(self.num_players):
+                for opponent in range(state.seats):
                     opponent_rows = opponent_mask & (state.current_actor == opponent)
                     if bool(opponent_rows.any().item()):
                         self.strategy_memories[opponent].add(
@@ -296,9 +429,6 @@ class CudaDeepCFRTrainer:
                             self.generator,
                         )
 
-            terminal_parents = torch.nonzero(state.terminal, as_tuple=False).squeeze(1)
-            traverser_edges = torch.nonzero(traverser_mask[:, None] & valid, as_tuple=False)
-            opponent_parents = torch.nonzero(opponent_mask, as_tuple=False).squeeze(1)
             if opponent_parents.numel():
                 sampled_slots = torch.multinomial(
                     strategy[opponent_parents],
@@ -316,11 +446,6 @@ class CudaDeepCFRTrainer:
                     sampled_slots,
                 )
             )
-            if child_parents.numel() > self.config.max_frontier_rows:
-                raise RuntimeError(
-                    f"CUDA Deep CFR frontier reached {child_parents.numel()} rows; "
-                    "reduce --parallel-traversals or the action abstraction"
-                )
             child = state.index_select(child_parents)
             actionable = child_slots >= 0
             if bool(actionable.any().item()):
@@ -356,13 +481,15 @@ class CudaDeepCFRTrainer:
                 )
             )
             state = child
+            remaining_depth -= 1
             self.frontier_layers += 1
             self.maximum_frontier_rows = max(self.maximum_frontier_rows, state.batch_size)
 
-        if bool((~state.terminal).any().item()):
-            self.depth_limit_rollouts += int((~state.terminal).sum().item())
-            state.rollout(128, self.generator)
-        values = state.utilities()[:, traverser] / float(self.table_config.starting_stacks[traverser])
+        if values is None:
+            if bool((~state.terminal).any().item()):
+                self.depth_limit_rollouts += int((~state.terminal).sum().item())
+                state.rollout(128, self.generator)
+            values = state.utilities()[:, traverser] / utility_scale
 
         for layer in reversed(layers):
             parent_values = torch.zeros((layer.parent_count,), dtype=torch.float32, device=self.device)
@@ -396,6 +523,7 @@ class CudaDeepCFRTrainer:
                     self.generator,
                 )
             values = parent_values
+        return values
 
     def _train_network(self, player: int, strategy: bool) -> float:
         memory = self.strategy_memories[player] if strategy else self.advantage_memories[player]
@@ -428,20 +556,61 @@ class CudaDeepCFRTrainer:
         return total / steps
 
     def stats(self) -> dict[str, Any]:
+        advantage_iteration_ranges = [memory.iteration_range() for memory in self.advantage_memories]
+        strategy_iteration_ranges = [memory.iteration_range() for memory in self.strategy_memories]
+        all_ranges = advantage_iteration_ranges + strategy_iteration_ranges
         return {
             "algorithm": "level_synchronous_cuda_deep_cfr",
             "num_players": self.num_players,
+            "minimum_players": self.config.minimum_players,
+            "maximum_players": self.num_players,
+            "supported_player_counts": list(range(self.config.minimum_players, self.num_players + 1)),
+            "randomized_player_counts": self.config.minimum_players < self.num_players,
+            "player_count_traversals": dict(self.player_count_traversals),
             "iterations": self.completed_iterations,
             "traversals": self.traversals,
             "frontier_layers": self.frontier_layers,
             "maximum_frontier_rows": self.maximum_frontier_rows,
+            "maximum_projected_frontier_rows": self.maximum_projected_frontier_rows,
+            "frontier_chunk_splits": self.frontier_chunk_splits,
             "depth_limit_rollouts": self.depth_limit_rollouts,
             "advantage_samples": [memory.size for memory in self.advantage_memories],
             "advantage_samples_seen": [memory.samples_seen for memory in self.advantage_memories],
+            "advantage_iteration_ranges": advantage_iteration_ranges,
             "strategy_samples": [memory.size for memory in self.strategy_memories],
             "strategy_samples_seen": [memory.samples_seen for memory in self.strategy_memories],
+            "strategy_iteration_ranges": strategy_iteration_ranges,
+            "latest_iteration_retained": bool(
+                self.completed_iterations > 0
+                and all(retained is not None and retained[1] == self.completed_iterations for retained in all_ranges)
+            ),
             "loss": {key: list(value) for key, value in self.losses.items()},
         }
+
+    def _validate_reservoir_freshness(self) -> None:
+        """Reject snapshots exhibiting the pre-fix frozen-reservoir signature."""
+        if self.completed_iterations < 4:
+            return
+        minimum_plausible_latest = self.completed_iterations // 2
+        stale: list[str] = []
+        for kind, memories in (
+            ("advantage", self.advantage_memories),
+            ("strategy", self.strategy_memories),
+        ):
+            for player, memory in enumerate(memories):
+                retained = memory.iteration_range()
+                if (
+                    memory.samples_seen > memory.capacity
+                    and (retained is None or retained[1] < minimum_plausible_latest)
+                ):
+                    stale.append(f"{kind}[{player}]={retained}")
+        if stale:
+            details = ", ".join(stale)
+            raise ValueError(
+                "CUDA Deep CFR snapshot reservoirs are severely stale "
+                f"at completed iteration {self.completed_iterations} ({details}). "
+                "This snapshot is affected by the pre-fix reservoir replacement bug; start a fresh run."
+            )
 
     def inference_payload(self) -> dict[str, Any]:
         return {
@@ -449,6 +618,7 @@ class CudaDeepCFRTrainer:
             "algorithm": "deep_cfr_average_strategy",
             "trainer": "level_synchronous_cuda_deep_cfr",
             "num_players": self.num_players,
+            "supported_player_counts": list(range(self.config.minimum_players, self.num_players + 1)),
             "encoder": self.encoder.state_dict(),
             "hidden": self.config.hidden,
             "strategy_networks": [network.state_dict() for network in self.strategy_networks],
@@ -490,6 +660,7 @@ class CudaDeepCFRTrainer:
         if int(payload.get("snapshot_version", -1)) != CUDA_DEEP_CFR_SNAPSHOT_VERSION:
             raise ValueError(f"Unsupported CUDA Deep CFR snapshot version: {payload.get('snapshot_version')}")
         stored_config = dict(payload["config"])
+        stored_config.setdefault("minimum_players", int(payload["table_config"]["seats"]))
         current_config = asdict(self.config)
         incompatible = {
             key: (stored_config.get(key), current_config.get(key))
@@ -520,5 +691,18 @@ class CudaDeepCFRTrainer:
         self.traversals = int(stats["traversals"])
         self.frontier_layers = int(stats["frontier_layers"])
         self.maximum_frontier_rows = int(stats["maximum_frontier_rows"])
+        self.maximum_projected_frontier_rows = int(
+            stats.get("maximum_projected_frontier_rows", self.maximum_frontier_rows)
+        )
+        self.frontier_chunk_splits = int(stats.get("frontier_chunk_splits", 0))
         self.depth_limit_rollouts = int(stats["depth_limit_rollouts"])
+        stored_player_count_traversals = stats.get("player_count_traversals")
+        if isinstance(stored_player_count_traversals, dict):
+            self.player_count_traversals = {
+                int(player_count): int(traversals)
+                for player_count, traversals in stored_player_count_traversals.items()
+            }
+        else:
+            self.player_count_traversals = {self.num_players: self.traversals}
         self.losses = {key: list(value) for key, value in stats["loss"].items()}
+        self._validate_reservoir_freshness()

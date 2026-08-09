@@ -10,17 +10,23 @@ from examples.train_cuda_deep_cfr import build_parser, require_single_gpu, run_f
 
 
 class TrainCudaDeepCFRCliTests(unittest.TestCase):
-    def test_defaults_describe_level_synchronous_three_player_training(self):
+    def test_defaults_describe_level_synchronous_mixed_player_training(self):
         args = build_parser().parse_args([])
 
         self.assertEqual(args.traversals_per_player, 4096)
-        self.assertEqual(args.parallel_traversals, 256)
+        self.assertEqual(args.parallel_traversals, 192)
         self.assertEqual(args.starting_stack, 200)
-        self.assertEqual(args.seats, 3)
+        self.assertEqual(args.seats, 9)
+        self.assertEqual(args.min_players, 3)
+        self.assertEqual(args.max_frontier_rows, 131_072)
+        self.assertEqual(args.advantage_capacity, 300_000)
+        self.assertEqual(args.strategy_capacity, 300_000)
         self.assertEqual(args.snapshot_every, 0)
 
         with self.assertRaises(ValueError):
             run_from_args(build_parser().parse_args(["--seats", "2"]), {})
+        with self.assertRaises(ValueError):
+            run_from_args(build_parser().parse_args(["--seats", "5", "--min-players", "6"]), {})
         with self.assertRaises(ValueError):
             run_from_args(build_parser().parse_args(["--snapshot-every", "-1"]), {})
 

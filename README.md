@@ -88,7 +88,7 @@ Examples:
   -ModelPath runs\poker_policy_gpu_100k.pt `
   -Port 8100
 
-# Play against the completed three-player, 500-iteration Deep CFR policy.
+# Reproduce the invalidated 500-iteration policy for diagnostics only.
 .\scripts\run_poker_arena.ps1 `
   -ModelPath runs\cuda_deep_cfr_3p_500_policy.pt `
   -Device cuda
@@ -119,7 +119,7 @@ CLI options:
 
 The launcher validates both the conda Python executable and checkpoint before starting. The checkpoint is loaded lazily when the first model-backed bot is reserved.
 
-Use the 5.70 MB inference policy with the GUI, not the 3.85 GB resumable training snapshot. The checkpoint loader detects the Deep CFR policy format automatically; no inference code or GUI configuration change is required.
+For a valid Deep CFR run, use its small inference policy with the GUI, not its multi-gigabyte resumable training snapshot. The checkpoint loader detects the Deep CFR policy format automatically; no inference code or GUI configuration change is required. The existing `cuda_deep_cfr_3p_100_*` and `cuda_deep_cfr_3p_500_*` artifacts are invalidated training outputs and must not be used as production opponents.
 
 The server prints a private host URL and a guest URL. Open the newly printed host URL after every restart. LAN mode uses plain HTTP and is intended only for trusted local networks; it is not a public deployment configuration.
 
@@ -135,11 +135,11 @@ The server prints a private host URL and a guest URL. Open the newly printed hos
 
 The host can start with any supported table size of at least two occupied seats. Joining humans or reserving bots only prepares the lobby: the backend cannot create the first table or deal cards until the authenticated host presses **Start Game**. The button remains disabled until at least two seats are occupied and becomes disabled permanently after the first hand begins.
 
-For the checkpoint's intended behavior, prepare exactly three occupied seats before **Start Game** is pressed. For solo play against the 500-iteration checkpoint, claim one human seat, reserve two bot seats, and then start the game. Both bot seats share one loaded policy object, while the policy selects the strategy network corresponding to the acting engine seat.
+For a future mixed-count checkpoint, prepare any supported table size from three through nine before **Start Game** is pressed. For solo play, claim one human seat, reserve the intended number of bot seats, and then start the game. All bot seats share one loaded policy object, while the policy selects the strategy network corresponding to the acting engine seat.
 
-The GUI also permits this checkpoint to run at any table size from two through nine. An exact three-player table uses the corresponding trained seat network. At any other player count, inference averages the logits from all three trained seat networks and emits one runtime warning for that table size. This deliberately lifts the hard player-count failure, but it is experimental extrapolation rather than a policy trained for that game size.
+Mixed-count policies record every player count encountered in training. Tables from three through nine use the corresponding trained seat network directly with no mismatch warning. A two-player table remains allowed by the GUI, but it uses the explicitly warned ensemble fallback because two-player play is outside the production training distribution. Legacy fixed-count checkpoints retain their earlier fallback behavior at mismatched table sizes.
 
-The browser table currently remains at 2,000 chips with 10/20 blinds (100 BB). The 500-iteration checkpoint was trained at 200 chips with 5/10 blinds (20 BB), so playing it in the current GUI is an out-of-distribution behavioral test rather than a controlled strength evaluation. This setting is intentionally unchanged; a future 100 BB training run can be selected through the same `-ModelPath` option.
+The browser table remains at 2,000 chips with 10/20 blinds (100 BB). The invalidated runs used 200 chips with 5/10 blinds (20 BB). The next formal run is planned for 1,000 chips with 5/10 blinds (100 BB), and its policy will be selectable through the same `-ModelPath` option without code changes.
 
 Session logs use zero-based numeric IDs in JSON but explicitly declare:
 
@@ -171,20 +171,21 @@ state = table.apply(Action.call())
 
 ## Deep CFR training
 
-The primary learning path is now three-to-nine-player external-sampling Deep CFR, with three players by default. It addresses the main limitations of the original 10k action-value checkpoint:
+The primary learning path is now mixed three-to-nine-player external-sampling Deep CFR. Before every traversal session, the CUDA RNG independently samples a valid player count. Sessions with the same count are grouped into CUDA batches, preserving parallel throughput without forcing every environment in a batch to use one permanent table size. It addresses the main limitations of the original 10k action-value checkpoint:
 
 - A traverser decision recursively branches over every legal abstract action. Descendant traverser decisions branch again, so this is branches-over-branches rather than one flat branch followed by a random rollout.
 - Opponent and chance nodes are sampled independently. Separate traversals receive independently shuffled undealt cards while preserving the public/private prefix already observed.
+- A projected frontier larger than the configured row budget is no longer fatal. The trainer splits its parent states into contiguous CUDA chunks, traverses each chunk independently at the same logical depth, concatenates their values in original order, and then continues normal back-propagation. `frontier_chunk_splits` and `maximum_projected_frontier_rows` expose how often this path was needed.
 - The current policy is derived from positive predicted counterfactual regrets. Deployment uses a separately learned average strategy and samples its action distribution; it is not deterministic `argmax` and does not hardcode bluff frequencies.
 - Bet sizing uses a compact legal abstraction: fold/check/call, minimum raise, one-third-pot, three-quarter-pot, 1.5x-pot, and all-in. Duplicate concrete raise totals are removed for short stacks.
-- Every seat has its own advantage network, average-strategy network, and two reservoir memories. Early data is not simply overwritten by recent play.
+- Every possible seat up to the configured maximum has its own advantage network, average-strategy network, and two reservoir memories. A seat is trained only in sampled table sizes where it exists, and the fixed-width state features explicitly encode the current player count. Early data is not simply overwritten by recent play.
 
 The implementation has two paths that share the same policy format:
 
 - `examples\train_deep_cfr.py` is the readable recursive reference trainer. It supports two-player Kuhn/Leduc validation and three-to-nine-player Hold'em experiments.
 - `examples\train_cuda_deep_cfr.py` is the production single-GPU trainer. It executes traversals as level-synchronous CUDA frontiers, expands every traverser action, samples one action at each non-traverser node, and back-propagates the selected traverser's terminal value through the recorded frontier.
 
-The exact Nash-convergence guarantee associated with CFR is specific to two-player zero-sum games. Multi-player poker remains constant-sum, but independent regret minimization is not guaranteed to converge to a Nash equilibrium. The three-player trainer is therefore an intentional practical extension whose checkpoints must be judged empirically, not labeled solved from training loss alone.
+The exact Nash-convergence guarantee associated with CFR is specific to two-player zero-sum games. Multi-player poker remains constant-sum, but independent regret minimization is not guaranteed to converge to a Nash equilibrium. Mixed three-to-nine-player training is therefore an intentional practical extension whose checkpoints must be judged empirically, not labeled solved from training loss alone.
 
 ### Validation gates
 
@@ -210,7 +211,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\train_cuda_deep_cfr.ps1 `
   -Iterations 5 `
   -TraversalsPerPlayer 256 `
   -ParallelTraversals 64 `
-  -Seats 3 `
+  -MinPlayers 3 `
+  -Seats 9 `
   -SnapshotOut runs\cuda_deep_cfr_smoke_snapshot.pt `
   -PolicyOut runs\cuda_deep_cfr_smoke_policy.pt
 ```
@@ -221,50 +223,57 @@ For a longer run:
 powershell -ExecutionPolicy Bypass -File .\scripts\train_cuda_deep_cfr.ps1 `
   -Iterations 100 `
   -TraversalsPerPlayer 4096 `
-  -ParallelTraversals 512 `
-  -Seats 3 `
+  -ParallelTraversals 192 `
+  -MinPlayers 3 `
+  -Seats 9 `
+  -StartingStack 1000 `
   -SnapshotOut runs\cuda_deep_cfr_snapshot.pt `
   -PolicyOut runs\cuda_deep_cfr_average_policy.pt
 ```
 
-Resume adds the requested number of new iterations and restores every seat's networks and reservoirs, counters, and random-number-generator states. The resume seat count must match the snapshot. Runtime-only controls such as iteration count, parallel traversal count, and frontier safety limit may change safely:
+`-MinPlayers` and `-Seats` define the inclusive randomized range; setting both to the same value preserves fixed-count training. `TraversalsPerPlayer` is performed for every possible seat up to `-Seats`, so a 3–9 run performs nine times that number of sessions per iteration. The sampled sessions are grouped by player count before tensor traversal.
+
+Reservoir capacities are per possible seat. The mixed-count production defaults use 300,000 advantage and 300,000 strategy samples per seat, putting aggregate reservoir memory about 10% below the former three-seat configuration of one million samples per seat. Production parallelism defaults to 192 traversals and materialized frontier chunks target at most 131,072 rows. Larger projected trees are split rather than terminating the run. These settings leave more headroom for the desktop and nine-seat tensor states; raising the capacities or returning to 256-512 parallel traversals can still exhaust VRAM or make the machine intermittently unresponsive.
+
+Resume adds the requested number of new iterations and restores every seat's networks and reservoirs, player-count sampling counters, and random-number-generator states. Both ends of the player-count range must match the snapshot. Runtime-only controls such as iteration count, parallel traversal count, and frontier safety limit may change safely. Resume only from a post-fix snapshot whose summary passes the reservoir checks below; the invalidated 100/500 snapshots are rejected by the loader:
 
 ```powershell
 .\scripts\train_cuda_deep_cfr.ps1 `
   -Iterations 400 `
-  -Seats 3 `
-  -ParallelTraversals 512 `
+  -MinPlayers 3 `
+  -Seats 9 `
+  -ParallelTraversals 192 `
   -SnapshotEvery 100 `
-  -ResumeSnapshot runs\cuda_deep_cfr_3p_100_snapshot.pt `
-  -SnapshotOut runs\cuda_deep_cfr_3p_500_snapshot.pt `
-  -PolicyOut runs\cuda_deep_cfr_3p_500_policy.pt
+  -ResumeSnapshot runs\cuda_deep_cfr_mixed_3to9_fresh_100_snapshot.pt `
+  -SnapshotOut runs\cuda_deep_cfr_mixed_3to9_fresh_500_snapshot.pt `
+  -PolicyOut runs\cuda_deep_cfr_mixed_3to9_fresh_500_policy.pt
 ```
 
-`--snapshot-every` atomically refreshes the resumable snapshot after that many new iterations; an interrupted write cannot replace the last complete snapshot. Important production controls are `--parallel-traversals` and `--max-frontier-rows` for peak GPU memory, reservoir capacities for retained training data, and the per-network training-step counts. A completed sound traversal should report `depth_limit_rollouts: 0`; a nonzero value means the safety depth bound was reached and the configuration must be investigated before trusting that run.
+`--snapshot-every` atomically refreshes the resumable snapshot after that many new iterations; an interrupted write cannot replace the last complete snapshot. Important production controls are `--parallel-traversals` and `--max-frontier-rows` for peak GPU memory, reservoir capacities for retained training data, and the per-network training-step counts. A completed sound traversal should report `depth_limit_rollouts: 0`, `latest_iteration_retained: true`, and an `advantage_iteration_ranges` and `strategy_iteration_ranges` entry for every seat whose maximum is the completed iteration. A failed freshness check invalidates the run regardless of counters or loss. A nonzero depth-limit count also requires investigation before trusting the run.
 
 Deep CFR iteration counts are not comparable to the old checkpoint's generated-hand count. Each iteration performs many player-specific traversals and recursively evaluates multiple actions.
 
-### Verified local runs (2026-08-01)
+### Invalidated local runs and root cause (2026-08-01)
 
-The production path has been exercised end to end on the target RTX 5070 Ti. The 500-iteration run resumed the complete 100-iteration training snapshot, changed only runtime-safe controls, and completed successfully:
+The original 100- and 500-iteration runs completed mechanically, but their learned policies are invalid. `CudaReservoirBuffer.add` attempted batched replacement with advanced-indexed `.copy_()` and `.fill_()` calls. PyTorch advanced indexing returned temporary tensors, so the underlying reservoir rows stopped changing after the initial one-million-row fill even though `samples_seen`, traversal counts, losses, and snapshots continued to advance. The 500-iteration run inherited the frozen memory from the 100-iteration snapshot.
 
-| Checkpoint | Training path | Parallel traversals | Total traversals | Maximum frontier rows | Depth-limit rollouts |
-| --- | --- | ---: | ---: | ---: | ---: |
-| 100 iterations | Fresh three-player run | 256 | 1,228,800 | 64,244 | 0 |
-| 500 iterations | Resume at 100, add 400 | 512 | 6,144,000 | 124,971 | 0 |
+| Checkpoint | Training path | Traversals | Status |
+| --- | --- | ---: | --- |
+| 100 iterations | Fresh three-player, 20 BB | 1,228,800 | Invalid; do not deploy or resume |
+| 500 iterations | Resume at 100, add 400 | 6,144,000 | Invalid; do not deploy or resume |
 
-All three advantage reservoirs and all three strategy reservoirs reached their configured capacity of 1,000,000 retained samples. The final local artifacts are `runs\cuda_deep_cfr_3p_500_snapshot.pt` (about 3.85 GB), `runs\cuda_deep_cfr_3p_500_policy.pt` (about 5.70 MB), and `runs\cuda_deep_cfr_3p_500_summary.json`. The inference policy was loaded after training, all network parameters were finite, and it produced a legal action in a three-player table. These generated artifacts remain local and are not required in the Git repository.
+Forensic inspection of the 500-iteration snapshot found newest retained advantage iterations `[8, 6, 6]` and newest retained strategy iterations `[3, 5, 3]` instead of 500. A duplicate-deal audit also found that forcing a pre-flop all-in with 75o lost about 2.63 BB per hand against the deployed average opponents and about 4.05 BB against final regret-matched opponents. This confirms destructive policy drift rather than healthy learned aggression.
 
-On the same 4,096-traversals-per-player benchmark, increasing `--parallel-traversals` from 256 to 512 reduced elapsed time from 27.76 seconds to 14.92 seconds (about 1.86x faster), while peak allocated GPU memory increased from about 4.1 GB to 5.1 GB. This is why the resumed production run uses 512.
+The replacement path now uses `index_copy_` and `index_fill_` on the original tensors. A deterministic regression test fills a reservoir, adds thousands of later samples, and verifies that features, masks, targets, and iteration ages are replaced together. Training summaries now expose retained iteration ranges, and snapshot loading rejects the severe frozen-memory signature.
 
-An exploratory evaluation of the 100-iteration policy against the original 10k action-value checkpoint used 200 rotated deals, or 600 tracked-policy hands. It measured +10 BB/100 with a 95% confidence interval of -65.9 to +85.9 BB/100. The policy raised on 57% of its 984 observed decisions, so it was clearly not behaving like the earlier overly conservative deterministic bot, but the interval is much too wide to claim that it is stronger. Run completion and training loss are not strength measurements.
+The previous throughput benchmark remains useful only for sizing: at 4,096 traversals per player, increasing parallel traversals from 256 to 512 reduced elapsed time from 27.76 seconds to 14.92 seconds (about 1.86x) while peak allocated GPU memory rose from about 4.1 GB to 5.1 GB. It does not validate policy quality.
 
-The next evaluation steps are:
+No corrected formal checkpoint exists yet. The previously requested launch was stopped before iteration output or a checkpoint was written. The next steps are:
 
-1. Evaluate the 500-iteration policy against both the 100-iteration policy and the original 10k checkpoint on at least 10,000 rotated deals per matchup.
-2. Compare grouped confidence intervals, seat-specific results, fold/call/raise frequencies by street, and raise-size distributions rather than relying only on aggregate BB/100.
-3. Review representative hand histories for value bets, bluff candidates, and bluff catches, especially on the sparsely sampled turn and river.
-4. Continue from the 500-iteration snapshot only after these comparisons show whether more traversals, a larger model, or a broader action abstraction is the most useful next investment.
+1. On explicit approval, start a fresh mixed 3–9-player 100-BB run; never resume either invalidated snapshot.
+2. At every saved checkpoint, require coverage in `player_count_traversals`, fresh reservoir ranges, zero depth-limit rollouts, finite networks, and legal-action inference smoke tests at every supported table size.
+3. Before GUI deployment, audit weak offsuit pre-flop all-ins and evaluate at least 10,000 rotated duplicate deals per matchup and player count.
+4. Compare confidence intervals, seat, table-size, and street telemetry plus representative hand histories before deciding whether to add iterations or model capacity.
 
 ### Evaluation and deployment
 
@@ -293,7 +302,7 @@ bot = TorchPolicyBot.from_checkpoint(
 )
 ```
 
-The policy records its trained player count. A matching table selects the corresponding seat-specific strategy network; a mismatched two-to-nine-player table uses the explicitly warned ensemble fallback described above. Preserve the original 10k checkpoint as a baseline and compare checkpoints on rotated duplicate deals rather than judging a few manually selected hands. Bluffing is expected to emerge as part of the learned mixed strategy, but it still needs empirical validation; the architecture does not guarantee a strong policy after a short run.
+The policy records its supported player-count range. A supported table selects the corresponding seat-specific strategy network; an unsupported two-to-nine-player table uses the explicitly warned ensemble fallback described above. Preserve the original 10k checkpoint as a baseline and compare checkpoints on rotated duplicate deals rather than judging a few manually selected hands. Bluffing is expected to emerge as part of the learned mixed strategy, but it still needs empirical validation; the architecture does not guarantee a strong policy after a short run.
 
 ## Improved prefix-branch baseline
 
@@ -327,7 +336,7 @@ Run the complete suite without writing Python bytecode or pytest cache files:
 C:\conda_envs\poker_ai_env\python.exe -B -m pytest -p no:cacheprovider -q
 ```
 
-The suite covers cards, evaluator rankings, betting rules, all-in runouts, side pots, uncalled returns, stable web-seat IDs, session logs, host authentication, browser assets, bots, exact Kuhn/Leduc exploitability, three-player recursive and CUDA Deep CFR, reservoir sampling, resumable snapshots, seat-rotated duplicate-deal evaluation, CUDA CLI configuration, and tensor/reference-engine agreement.
+The suite covers cards, evaluator rankings, betting rules, all-in runouts, side pots, uncalled returns, stable web-seat IDs, session logs, host authentication, browser assets, bots, exact Kuhn/Leduc exploitability, recursive and mixed-count CUDA Deep CFR, reservoir sampling, resumable snapshots, seat-rotated duplicate-deal evaluation, CUDA CLI configuration, and tensor/reference-engine agreement.
 
 ## Project layout
 
@@ -347,7 +356,7 @@ runs/                            checkpoints and training summaries
 
 ## Current limitations
 
-- Production Deep CFR training uses one fixed 3-9-player table size and stores a separate policy/memory set for every trained seat. Inference at a different 2-9-player table size is allowed through an ensemble fallback, but remains out of distribution until training itself mixes player counts or uses a shared strategy network.
+- Production Deep CFR samples table sizes from a configured 3-9 range and stores a separate policy/memory set for every possible seat up to the maximum. Higher seat IDs necessarily receive data only from larger tables, so coverage and strength must be measured separately by player count. Two-player inference remains an out-of-distribution ensemble fallback.
 - Multi-player CFR does not inherit the two-player zero-sum Nash-convergence guarantee, so rotated empirical evaluation is mandatory.
 - Full Hold'em is evaluated empirically; exact exploitability and exact best response are available only for the finite Kuhn/Leduc validation games.
 - The compact action abstraction cannot represent every legal integer bet size.

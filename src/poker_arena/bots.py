@@ -176,6 +176,8 @@ class DeepCFRAveragePolicyBot:
 
         self.networks = networks
         self.num_players = len(networks)
+        supported = payload.get("supported_player_counts", [self.num_players])
+        self.supported_player_counts = tuple(int(player_count) for player_count in supported)  # type: ignore[arg-type]
         self.encoder = encoder
         self.payload = payload
         self.device = device
@@ -215,6 +217,17 @@ class DeepCFRAveragePolicyBot:
         num_players = int(payload.get("num_players", len(network_states)))
         if num_players < 2 or len(network_states) != num_players:
             raise ValueError("Deep CFR policy must contain one average-strategy network per player")
+        supported_player_counts = payload.get("supported_player_counts", [num_players])
+        if (
+            not isinstance(supported_player_counts, list)
+            or not supported_player_counts
+            or any(
+                not isinstance(player_count, int) or not 2 <= player_count <= num_players
+                for player_count in supported_player_counts
+            )
+            or supported_player_counts != sorted(set(supported_player_counts))
+        ):
+            raise ValueError("Deep CFR policy has invalid supported player counts")
         table_config = payload.get("table_config")
         if isinstance(table_config, dict) and int(table_config.get("seats", num_players)) != num_players:
             raise ValueError("Deep CFR policy player count disagrees with its table configuration")
@@ -256,11 +269,16 @@ class DeepCFRAveragePolicyBot:
         actor = view.current_actor
         if actor is None or actor not in view.stacks:
             raise ValueError("Deep CFR policy requires a live actor present in the table view")
-        player_count_mismatch = table_players != self.num_players
-        if player_count_mismatch and table_players not in self._warned_player_counts:
+        player_count_supported = table_players in self.supported_player_counts
+        if not player_count_supported and table_players not in self._warned_player_counts:
+            trained_description = (
+                str(self.supported_player_counts[0])
+                if len(self.supported_player_counts) == 1
+                else f"{self.supported_player_counts[0]}-{self.supported_player_counts[-1]}"
+            )
             warnings.warn(
-                f"Deep CFR policy was trained for {self.num_players} players but is being used with "
-                f"{table_players}; averaging its trained seat networks for experimental, "
+                f"Deep CFR policy was trained for {trained_description} players but is being used with "
+                f"{table_players}; averaging its seat networks for experimental, "
                 "out-of-distribution inference",
                 RuntimeWarning,
                 stacklevel=2,
@@ -275,7 +293,7 @@ class DeepCFRAveragePolicyBot:
         features = self.encoder.encode_view(view, legal_actions)
         inputs = torch.tensor([features], dtype=torch.float32, device=self.device)
         with torch.no_grad():
-            if player_count_mismatch:
+            if not player_count_supported:
                 outputs = torch.stack([network(inputs)[0] for network in self.networks]).mean(dim=0)
             else:
                 outputs = self.networks[actor](inputs)[0]
